@@ -416,8 +416,7 @@ def load_data():
 # ─────────────────────────────────────────────────────────────────
 PATHS = {
     "perceptron": "perceptron_model.h5",
-    "ann":        "ann_model.h5",
-    "cnn":        "cnn_model.h5",
+    "cnn": "cnn_model.h5",
 }
 
 @st.cache_resource(show_spinner=False)
