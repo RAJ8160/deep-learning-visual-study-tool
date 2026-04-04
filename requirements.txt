@@ -6,3 +6,4 @@ h5py
 pandas
 seaborn
 streamlit-drawable-canvas
+tensorflow-cpu==2.15.0
