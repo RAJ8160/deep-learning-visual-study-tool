@@ -34,6 +34,15 @@ PROBLEM FIX (v2):
   - CNN rS5: Dense neuron grid overflows — repositioned with correct bounds
   - All animations: drawn digits no longer show "WRONG" — show neutral "?" state
 """
+import sys
+import subprocess
+
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install",
+    "tensorflow-cpu==2.15.0"
+])
+
+import tensorflow as tf
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
