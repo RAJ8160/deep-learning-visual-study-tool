@@ -1,0 +1,2105 @@
+"""
+Deep Learning Visual Study Tool — Perceptron · ANN · CNN
+=========================================================
+FIXED VERSION — Drawing pad fully working.
+
+ROOT CAUSE OF BROKEN DRAWING:
+  components.html() ALWAYS returns None in Streamlit.
+  Streamlit.setComponentValue / postMessage return channel only works
+  with declare_component(). So the original predict button in the canvas
+  did literally nothing in Python — pixels never arrived.
+
+THE FIX — st.query_params bridge:
+  1. JS encodes 784 pixels as hex string (1568 chars, safe for URLs)
+  2. JS writes it to parent URL via window.parent.history.replaceState()
+     — NO page reload, just updates the query string
+  3. A normal Streamlit button triggers rerun
+  4. Python reads st.query_params["pixels"], decodes hex → numpy array
+  5. Predictions run immediately on same rerun
+
+OTHER FIXES:
+  - Drawing pad NOT inside st.columns (was clipping iframe + breaking events)
+  - Single button click = draw + predict (no two-step confusion)
+  - No st.rerun() loop inside the draw function
+  - compile=False on model loading (removes absl warnings)
+
+OVERLAP FIX (2025):
+  - build_perceptron_anim rS4: bar chart repositioned BELOW network row
+    (was at bx=INP_X-50 which overlapped input neuron column)
+"""
+
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["ABSL_MIN_LOG_LEVEL"]    = "3"
+
+import json
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+import tensorflow as tf
+tf.get_logger().setLevel("ERROR")
+
+from tensorflow.keras.models import load_model, Model
+from tensorflow.keras.utils import to_categorical
+
+
+# ─────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="DL Visual Study — Perceptron · ANN · CNN",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# GLOBAL CSS
+# ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500&display=swap');
+:root{
+  --bg:#0b0f1a; --surf:#111827; --surf2:#1a2236; --border:#1f2d45; --border2:#2a3f5f;
+  --blue:#4f9eff; --cyan:#22d3ee; --green:#34d399; --yellow:#fbbf24;
+  --orange:#fb923c; --pink:#f472b6; --purple:#a78bfa; --red:#f87171;
+  --text:#e2e8f0; --muted:#64748b;
+  --mono:'JetBrains Mono',monospace; --head:'Space Grotesk',sans-serif; --body:'Inter',sans-serif;
+}
+html,body,[class*="css"]{font-family:var(--body)!important;background:var(--bg)!important;color:var(--text)!important;}
+section[data-testid="stSidebar"]{background:var(--surf)!important;border-right:1px solid var(--border)!important;}
+section[data-testid="stSidebar"] *{color:var(--text)!important;}
+h1{font-family:var(--head)!important;font-size:2rem!important;font-weight:700!important;color:#fff!important;}
+h2{font-family:var(--head)!important;font-size:1.3rem!important;font-weight:600!important;color:var(--text)!important;}
+h3{font-family:var(--head)!important;font-size:1.05rem!important;font-weight:600!important;color:var(--cyan)!important;}
+.hero{background:linear-gradient(135deg,#0f1f3d,#0b1628,#0f1a2e);border:1px solid var(--border2);
+  border-radius:16px;padding:1.8rem 2.4rem;margin-bottom:1.2rem;position:relative;overflow:hidden;}
+.hero::before{content:'';position:absolute;inset:0;
+  background:radial-gradient(ellipse at 20% 50%,rgba(79,158,255,.12),transparent 60%),
+             radial-gradient(ellipse at 80% 20%,rgba(167,139,250,.08),transparent 50%);}
+.hero-title{font-family:var(--head);font-size:1.8rem;font-weight:700;color:#fff;margin:0 0 .3rem;position:relative;}
+.hero-sub{font-size:.95rem;color:#94a3b8;position:relative;}
+.model-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:1rem 0 1.4rem;}
+.model-card{background:var(--surf);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;border-top:3px solid;}
+.mc-name{font-family:var(--head);font-size:.95rem;font-weight:700;margin-bottom:.3rem;}
+.mc-desc{font-size:.8rem;color:var(--muted);line-height:1.55;}
+.mc-tag{display:inline-block;font-family:var(--mono);font-size:.7rem;font-weight:700;padding:2px 8px;border-radius:10px;margin-top:.5rem;}
+.lrow{display:flex;align-items:stretch;gap:0;background:var(--surf);border:1px solid var(--border);border-radius:10px;margin:.35rem 0;overflow:hidden;}
+.lnum{min-width:34px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:.83rem;font-weight:700;background:var(--surf2);}
+.lbody{padding:.6rem .9rem;flex:1;}
+.lname{font-family:var(--mono);font-size:.83rem;font-weight:600;}
+.lshape{font-family:var(--mono);font-size:.74rem;color:var(--muted);margin-left:8px;}
+.ldesc{font-size:.77rem;color:var(--muted);margin-top:.18rem;line-height:1.42;}
+.callout{border-radius:10px;padding:.8rem 1.1rem;margin:.5rem 0;font-size:.87rem;line-height:1.65;border-left:3px solid;}
+.cb{background:rgba(79,158,255,.08);border-color:var(--blue);color:#93c5fd;}
+.cg{background:rgba(52,211,153,.08);border-color:var(--green);color:#6ee7b7;}
+.cy{background:rgba(251,191,36,.08);border-color:var(--yellow);color:#fde68a;}
+.cp{background:rgba(167,139,250,.08);border-color:var(--purple);color:#c4b5fd;}
+.co{background:rgba(251,146,60,.08);border-color:var(--orange);color:#fdba74;}
+.cr{background:rgba(244,114,182,.08);border-color:var(--pink);color:#fbcfe8;}
+.metric-row{display:flex;gap:10px;flex-wrap:wrap;}
+.metric{background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:.5rem .9rem;font-family:var(--mono);font-size:.8rem;}
+.mv{font-size:1.25rem;font-weight:700;display:block;}
+.mk{color:var(--muted);font-size:.7rem;}
+.rcard{background:var(--surf);border:2px solid;border-radius:14px;padding:1.1rem 1.4rem;text-align:center;}
+.rdigit{font-family:var(--mono);font-size:4rem;font-weight:700;line-height:1;}
+.rlabel{font-size:.78rem;color:var(--muted);margin-top:.35rem;text-transform:uppercase;letter-spacing:.08em;}
+.rconf{font-family:var(--mono);font-size:1rem;font-weight:600;margin-top:.25rem;}
+div.stButton>button{background:linear-gradient(135deg,#1d4ed8,#2563eb)!important;color:#fff!important;
+  border:none!important;border-radius:10px!important;font-family:var(--head)!important;
+  font-size:.88rem!important;font-weight:600!important;padding:.6rem 1.6rem!important;
+  transition:all .2s!important;box-shadow:0 4px 18px rgba(37,99,235,.4)!important;}
+div.stButton>button:hover{box-shadow:0 6px 26px rgba(37,99,235,.65)!important;transform:translateY(-2px)!important;}
+.step-row{display:flex;gap:6px;margin:.5rem 0 .8rem;}
+.step-mini{flex:1;text-align:center;background:var(--surf);border:1px solid var(--border);
+  border-top:3px solid;border-radius:8px;padding:.45rem .2rem;}
+.sm-emoji{font-size:1.2rem;}
+.sm-name{font-family:var(--mono);font-size:.7rem;font-weight:700;margin:.15rem 0 .1rem;}
+.sm-desc{font-size:.64rem;color:var(--muted);line-height:1.35;}
+hr{border-color:var(--border)!important;}
+::-webkit-scrollbar{width:5px;}::-webkit-scrollbar-track{background:var(--bg);}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+# DRAWING PAD  — FIXED VERSION
+# ─────────────────────────────────────────────────────────────────
+
+_DRAW_PAD_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:#0b0f1a;font-family:'Space Grotesk',sans-serif;
+  color:#e2e8f0;padding:10px;
+  display:flex;flex-direction:column;align-items:center;gap:8px;
+}
+h3{font-size:12px;font-weight:700;color:#4f9eff;letter-spacing:.1em;
+   text-transform:uppercase;text-align:center}
+.sub{font-size:10px;color:#64748b;font-family:'JetBrains Mono',monospace;
+     text-align:center;margin-top:-4px}
+.main-row{display:flex;gap:12px;align-items:flex-start;
+          justify-content:center;flex-wrap:wrap}
+.cw{border-radius:10px;overflow:hidden;cursor:crosshair;
+    box-shadow:0 0 0 1px #1f2d45,0 0 24px rgba(79,158,255,.1)}
+canvas{display:block}
+.rc{display:flex;flex-direction:column;align-items:center;gap:7px}
+.pl{font-size:9px;color:#64748b;font-family:'JetBrains Mono',monospace}
+#preview{border-radius:5px;image-rendering:pixelated;border:1px solid #1f2d45}
+.sr{display:flex;align-items:center;gap:5px;font-size:10px;
+    color:#64748b;font-family:'JetBrains Mono',monospace}
+input[type=range]{width:60px;accent-color:#4f9eff}
+.tip{font-size:9px;color:#64748b;font-family:'JetBrains Mono',monospace;
+     text-align:center;line-height:1.5}
+.br{display:flex;gap:8px;width:100%;max-width:380px;justify-content:center}
+button{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;
+  padding:9px 18px;border-radius:10px;border:none;cursor:pointer;transition:all .18s}
+#bp{background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#fff;
+    box-shadow:0 4px 14px rgba(37,99,235,.45);flex:2}
+#bp:hover{box-shadow:0 6px 22px rgba(37,99,235,.7);transform:translateY(-1px)}
+#bc{background:#111827;color:#64748b;border:1px solid #1f2d45;flex:1}
+#bc:hover{border-color:#f87171;color:#f87171}
+#st{font-size:10px;font-family:'JetBrains Mono',monospace;
+    min-height:16px;text-align:center;padding:2px 0}
+</style>
+</head>
+<body>
+<h3>✏️ Draw a Digit (0–9)</h3>
+<p class="sub">Draw → click Predict → see all 3 models below</p>
+
+<div class="main-row">
+  <div class="cw" id="cw"><canvas id="cv"></canvas></div>
+  <div class="rc">
+    <div class="pl">28×28 model input</div>
+    <canvas id="preview" width="28" height="28" style="width:84px;height:84px"></canvas>
+    <div class="sr">Brush&nbsp;
+      <input type="range" id="brush" min="0.5" max="3.5" step="0.1" value="1.8">
+      <span id="bv">1.8</span>
+    </div>
+    <div class="tip">Draw large &amp; centred<br>for best accuracy</div>
+  </div>
+</div>
+
+<div id="st"></div>
+
+<div class="br">
+  <button id="bc">🗑 Clear</button>
+  <button id="bp">🔍 Predict All Models</button>
+</div>
+
+<script>
+const G=28, S=11;
+const cv  = document.getElementById('cv');
+const ct  = cv.getContext('2d');
+const pv  = document.getElementById('preview');
+const pt  = pv.getContext('2d');
+const stEl= document.getElementById('st');
+
+cv.width=G*S; cv.height=G*S;
+document.getElementById('cw').style.width  = (G*S)+'px';
+document.getElementById('cw').style.height = (G*S)+'px';
+
+const buf = new Float32Array(G*G);
+
+function redraw(){
+  ct.fillStyle='#0d1117'; ct.fillRect(0,0,cv.width,cv.height);
+  ct.strokeStyle='rgba(31,45,69,0.6)'; ct.lineWidth=0.5;
+  for(var i=0;i<=G;i++){
+    ct.beginPath();ct.moveTo(i*S,0);ct.lineTo(i*S,G*S);ct.stroke();
+    ct.beginPath();ct.moveTo(0,i*S);ct.lineTo(G*S,i*S);ct.stroke();
+  }
+  for(var r=0;r<G;r++) for(var c=0;c<G;c++){
+    var v=buf[r*G+c];
+    if(v>0.02){
+      var a=Math.min(v,1);
+      ct.fillStyle='rgba('+Math.round(15+64*a)+','+Math.round(30+128*a)+','+Math.round(50+205*a)+','+a+')';
+      ct.fillRect(c*S+1,r*S+1,S-1,S-1);
+    }
+  }
+}
+
+function renderPrev(){
+  var id=pt.createImageData(G,G);
+  for(var i=0;i<G*G;i++){
+    var v=Math.round(buf[i]*255);
+    id.data[i*4]=Math.round(v*0.3);
+    id.data[i*4+1]=Math.round(v*0.6+30);
+    id.data[i*4+2]=Math.min(v+60,255);
+    id.data[i*4+3]=255;
+  }
+  pt.putImageData(id,0,0);
+}
+
+function paint(cx,cy){
+  var br=parseFloat(document.getElementById('brush').value)||1.8;
+  var sig=br*S*0.72;
+  for(var r=0;r<G;r++) for(var c=0;c<G;c++){
+    var px=(c+0.5)*S, py=(r+0.5)*S;
+    var d=Math.sqrt((px-cx)*(px-cx)+(py-cy)*(py-cy));
+    var v=Math.exp(-(d*d)/(2*sig*sig));
+    if(v>0.04) buf[r*G+c]=Math.min(buf[r*G+c]+v*0.9,1);
+  }
+  redraw(); renderPrev();
+}
+
+function getXY(e){
+  var rect=cv.getBoundingClientRect();
+  var sx=cv.width/rect.width, sy=cv.height/rect.height;
+  if(e.touches) return [(e.touches[0].clientX-rect.left)*sx,(e.touches[0].clientY-rect.top)*sy];
+  return [(e.clientX-rect.left)*sx,(e.clientY-rect.top)*sy];
+}
+
+var painting=false;
+cv.addEventListener('mousedown', function(e){painting=true; var p=getXY(e); paint(p[0],p[1]);});
+cv.addEventListener('mousemove', function(e){if(painting){var p=getXY(e); paint(p[0],p[1]);}});
+window.addEventListener('mouseup', function(){painting=false;});
+cv.addEventListener('touchstart', function(e){e.preventDefault();painting=true;var p=getXY(e);paint(p[0],p[1]);},{passive:false});
+cv.addEventListener('touchmove',  function(e){e.preventDefault();if(painting){var p=getXY(e);paint(p[0],p[1]);}},{passive:false});
+window.addEventListener('touchend', function(){painting=false;});
+
+document.getElementById('bc').onclick=function(){
+  buf.fill(0); redraw(); renderPrev();
+  stEl.textContent=''; stEl.style.color='#64748b';
+};
+
+document.getElementById('brush').oninput=function(){
+  document.getElementById('bv').textContent=parseFloat(this.value).toFixed(1);
+};
+
+document.getElementById('bp').onclick=function(){
+  var maxVal=0;
+  for(var i=0;i<784;i++) if(buf[i]>maxVal) maxVal=buf[i];
+  if(maxVal<0.05){
+    stEl.textContent='⚠ Draw a digit first!';
+    stEl.style.color='#fb923c';
+    setTimeout(function(){stEl.textContent='';},2000);
+    return;
+  }
+
+  var hex='';
+  for(var i=0;i<784;i++){
+    var b=Math.min(Math.round(buf[i]*255),255);
+    var h=b.toString(16);
+    hex+=(h.length===1?'0'+h:h);
+  }
+
+  try{
+    var url=new URL(window.parent.location.href);
+    url.searchParams.set('pixels',hex);
+    window.parent.history.replaceState(null,'',url.toString());
+    stEl.textContent='✅ Click the blue Predict button below!';
+    stEl.style.color='#34d399';
+  }catch(err){
+    stEl.textContent='⚠ Bridge error: '+err.message;
+    stEl.style.color='#f87171';
+  }
+};
+
+redraw(); renderPrev();
+</script>
+</body>
+</html>"""
+
+
+def _decode_hex_pixels(hex_str):
+    """Decode 1568-char hex string → (28,28) float32 array in [0,1]."""
+    if not hex_str or len(hex_str.strip()) != 1568:
+        return None
+    try:
+        h = hex_str.strip()
+        arr = np.array(
+            [int(h[i*2:i*2+2], 16) / 255.0 for i in range(784)],
+            dtype="float32"
+        ).reshape(28, 28)
+        return arr
+    except Exception:
+        return None
+
+
+def render_draw_pad():
+    hex_pixels = st.query_params.get("pixels", None)
+    if hex_pixels:
+        arr = _decode_hex_pixels(hex_pixels)
+        if arr is not None:
+            prev = st.session_state.get("drawn_pixels")
+            if prev is None or not np.allclose(arr, prev, atol=0.005):
+                st.session_state["drawn_pixels"] = arr
+        try:
+            del st.query_params["pixels"]
+        except Exception:
+            pass
+
+    components.html(_DRAW_PAD_HTML, height=440, scrolling=False)
+
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        predict_clicked = st.button(
+            "🔍 Predict All Models",
+            key="_main_predict_btn",
+            use_container_width=True,
+        )
+
+    drawn = st.session_state.get("drawn_pixels")
+    if drawn is not None:
+        st.markdown(
+            "<div style='text-align:center;font-size:.82rem;color:#34d399;"
+            "font-family:monospace;margin-top:4px;'>✅ Drawing received — "
+            "predictions shown below</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            "<div style='text-align:center;font-size:.82rem;color:#64748b;"
+            "font-family:monospace;margin-top:4px;'>👆 Draw above → "
+            "click Predict All Models in canvas → click blue button here</div>",
+            unsafe_allow_html=True
+        )
+
+    return drawn
+
+
+# ─────────────────────────────────────────────────────────────────
+# DATA LOADING
+# ─────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_data():
+    csv_train, csv_test = "mnist_train.csv", "mnist_test.csv"
+    if os.path.exists(csv_train) and os.path.exists(csv_test):
+        df_tr = pd.read_csv(csv_train); df_te = pd.read_csv(csv_test)
+        y_tr  = df_tr["label"].values;  y_te  = df_te["label"].values
+        X_tr  = df_tr.drop("label", axis=1).values.astype("float32")
+        X_te  = df_te.drop("label", axis=1).values.astype("float32")
+    else:
+        (r_tr, y_tr_r),(r_te, y_te_r) = tf.keras.datasets.mnist.load_data()
+        X_tr = np.array(r_tr, dtype="float32", copy=True).reshape(-1, 784)
+        X_te = np.array(r_te, dtype="float32", copy=True).reshape(-1, 784)
+        y_tr = np.array(y_tr_r, dtype="int32", copy=True)
+        y_te = np.array(y_te_r, dtype="int32", copy=True)
+    X_tr_flat = np.ascontiguousarray((X_tr / 255.0), dtype="float32")
+    X_te_flat = np.ascontiguousarray((X_te / 255.0), dtype="float32")
+    X_tr_4d   = np.ascontiguousarray(X_tr_flat.reshape(-1, 28, 28, 1), dtype="float32")
+    X_te_4d   = np.ascontiguousarray(X_te_flat.reshape(-1, 28, 28, 1), dtype="float32")
+    y_tr = np.array(y_tr, dtype="int32", copy=True)
+    y_te = np.array(y_te, dtype="int32", copy=True)
+    return X_tr_flat, X_tr_4d, y_tr, X_te_flat, X_te_4d, y_te
+
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL LOADING
+# ─────────────────────────────────────────────────────────────────
+PATHS = {
+    "perceptron": "perceptron_model.h5",
+    "ann":        "ann_model.h5",
+    "cnn":        "cnn_model.h5",
+}
+
+@st.cache_resource(show_spinner=False)
+def load_all_models():
+    models = {}
+    for key, path in PATHS.items():
+        if not os.path.exists(path):
+            models[key] = None
+            continue
+        m = load_model(path, compile=False)
+        try:
+            raw_shape   = m.input_shape
+            dummy_shape = tuple(1 if d is None else d for d in raw_shape)
+            dummy       = np.zeros(dummy_shape, dtype="float32")
+            m.predict(dummy, verbose=0)
+        except Exception:
+            for shape in [(1, 28, 28, 1), (1, 28, 28), (1, 784)]:
+                try:
+                    m.predict(np.zeros(shape, dtype="float32"), verbose=0)
+                    break
+                except Exception:
+                    continue
+        models[key] = m
+    return models
+
+
+def get_model_input_shape(model):
+    try:
+        raw = model.input_shape
+        return tuple(1 if d is None else d for d in raw)
+    except Exception:
+        return (1, 784)
+
+
+def predict_on_array(model, pixels_28x28: np.ndarray, model_key: str):
+    in_shape = get_model_input_shape(model)
+    if in_shape[-1] == 1 and len(in_shape) == 4:
+        img_in = pixels_28x28.reshape(1, 28, 28, 1)
+    elif len(in_shape) == 3:
+        img_in = pixels_28x28.reshape(1, 28, 28)
+    else:
+        img_in = pixels_28x28.reshape(1, 784)
+    img_4d = pixels_28x28.reshape(1, 28, 28, 1)
+    probs  = model.predict(img_in, verbose=0)[0]
+    pred   = int(np.argmax(probs))
+    return probs, pred, img_4d
+
+
+# ─────────────────────────────────────────────────────────────────
+# ACTIVATION MAPS  (CNN only)
+# ─────────────────────────────────────────────────────────────────
+def get_activation_maps(model, img4):
+    convs = [l for l in model.layers if isinstance(l, tf.keras.layers.Conv2D)]
+    if len(convs) < 2:
+        return None
+    def to_np(x):
+        if hasattr(x, "numpy"): return np.array(x.numpy(), copy=True)
+        return np.array(x, copy=True)
+    try:
+        am = Model(inputs=model.input, outputs=[convs[0].output, convs[1].output])
+        c1, c2 = am.predict(img4, verbose=0)
+        return {"conv1": to_np(c1), "conv2": to_np(c2)}
+    except Exception: pass
+    try:
+        x = tf.constant(img4, dtype=tf.float32); hit=0; o1=o2=None
+        for layer in model.layers:
+            x = layer(x, training=False)
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                hit += 1
+                if hit==1: o1=to_np(x)
+                elif hit==2: o2=to_np(x); break
+        if o1 is not None and o2 is not None:
+            return {"conv1": o1, "conv2": o2}
+    except Exception: pass
+    return None
+
+
+def activation_thumbnails(act4d, n=16, thumb=8):
+    act = act4d[0]; result=[]
+    for f in range(min(n, act.shape[-1])):
+        fm = act[:,:,f]; mx = fm.max()
+        if mx>0: fm = fm/mx
+        rows = np.array_split(fm, thumb, axis=0)
+        small=[]
+        for rg in rows:
+            cols = np.array_split(rg, thumb, axis=1)
+            small.append([float(round(c.mean(),3)) for c in cols])
+        result.append(small)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# MATPLOTLIB HELPERS
+# ─────────────────────────────────────────────────────────────────
+BG="#0b0f1a"; CARD="#111827"; ACC="#4f9eff"; GRN="#34d399"; ORG="#fb923c"; MUT="#64748b"
+
+def fig_digit(img2d, label=None, title_override=None):
+    fig, ax = plt.subplots(figsize=(3,3), facecolor=CARD)
+    ax.imshow(img2d, cmap="Blues", interpolation="nearest")
+    title = title_override if title_override else (f"True Label: {label}" if label is not None else "Drawn Digit")
+    ax.set_title(title, color=ACC, fontfamily="monospace", fontsize=12, fontweight="bold", pad=8)
+    ax.axis("off"); ax.set_facecolor(CARD); fig.tight_layout(pad=0.5)
+    return fig
+
+def fig_actmaps(act4d, name, nf=16, cols=8):
+    act=act4d[0]; n=min(nf,act.shape[-1]); rows=(n+cols-1)//cols
+    fig,axes=plt.subplots(rows,cols,figsize=(cols*1.7,rows*1.7),facecolor=BG)
+    axes=np.array(axes).reshape(rows,cols)
+    for i in range(rows*cols):
+        r,c=divmod(i,cols); ax=axes[r,c]
+        if i<n: ax.imshow(act[:,:,i],cmap="plasma",interpolation="nearest"); ax.set_title(f"F{i+1}",color=MUT,fontsize=7,pad=2)
+        ax.axis("off"); ax.set_facecolor(BG)
+    fig.suptitle(f"Activation Maps — {name}",color=ACC,fontfamily="monospace",fontsize=11,fontweight="bold",y=1.01)
+    fig.patch.set_facecolor(BG); fig.tight_layout(pad=0.4)
+    return fig
+
+def fig_conf(probs, title="Softmax Output"):
+    fig,ax=plt.subplots(figsize=(6,3.5),facecolor=BG); ax.set_facecolor(CARD)
+    cls=list(range(10)); colors=[GRN if i==int(np.argmax(probs)) else ACC for i in cls]
+    bars=ax.barh(cls,probs,color=colors,edgecolor="none",height=0.7)
+    ax.set_yticks(cls); ax.set_yticklabels([str(c) for c in cls],color=MUT,fontfamily="monospace",fontsize=9)
+    ax.set_xlim(0,1.05); ax.set_xlabel("Probability",color=MUT,fontsize=9,fontfamily="monospace")
+    ax.set_title(title,color=ACC,fontfamily="monospace",fontsize=10,fontweight="bold")
+    ax.tick_params(colors=MUT,labelsize=8)
+    for sp in ax.spines.values(): sp.set_edgecolor(MUT); sp.set_linewidth(0.3)
+    for bar,p in zip(bars,probs):
+        ax.text(p+0.01,bar.get_y()+bar.get_height()/2,f"{p*100:.1f}%",va="center",ha="left",
+                color=MUT,fontfamily="monospace",fontsize=7)
+    fig.tight_layout(pad=0.5); return fig
+
+def fig_all_models_conf(results: dict):
+    keys = [k for k in ["perceptron","ann","cnn"] if k in results]
+    n = len(keys)
+    if n == 0: return None
+    fig, axes = plt.subplots(1, n, figsize=(n*5, 3.5), facecolor=BG)
+    if n == 1: axes = [axes]
+    colors_map = {"perceptron":"#4f9eff","ann":"#fbbf24","cnn":"#34d399"}
+    for ax, key in zip(axes, keys):
+        probs, pred = results[key]
+        ax.set_facecolor(CARD)
+        cls = list(range(10))
+        colors = [colors_map[key] if i==pred else "#1e3a5f" for i in cls]
+        ax.barh(cls, probs, color=colors, edgecolor="none", height=0.7)
+        ax.set_yticks(cls); ax.set_yticklabels([str(c) for c in cls], color=MUT, fontfamily="monospace", fontsize=9)
+        ax.set_xlim(0, 1.05)
+        ax.set_title(f"{key.upper()}  →  {pred}  ({probs[pred]*100:.1f}%)",
+                     color=colors_map[key], fontfamily="monospace", fontsize=10, fontweight="bold")
+        ax.tick_params(colors=MUT, labelsize=8)
+        for sp in ax.spines.values(): sp.set_edgecolor(MUT); sp.set_linewidth(0.3)
+    fig.patch.set_facecolor(BG); fig.tight_layout(pad=0.6)
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────
+# ANIMATION SHELL
+# ─────────────────────────────────────────────────────────────────
+ANIM_CSS = """
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0b0f1a;font-family:'Inter',sans-serif;color:#e2e8f0;padding:10px 12px 8px;margin:0}
+canvas{display:block;width:100%;border-radius:12px;border:1px solid #1f2d45}
+.ctrl{display:flex;align-items:center;gap:7px;margin-top:10px;flex-wrap:wrap}
+.cbtn{font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:600;padding:7px 14px;
+  border-radius:8px;border:1px solid #1f2d45;cursor:pointer;background:#111827;
+  color:#e2e8f0;transition:all .15s}
+.cbtn:hover{border-color:#4f9eff;color:#4f9eff}
+.cbtn.pri{background:linear-gradient(135deg,#1d4ed8,#2563eb);border-color:#2563eb;color:#fff}
+.cbtn.pri:hover{box-shadow:0 0 14px rgba(37,99,235,.5)}
+.cbtn:disabled{opacity:.3;cursor:default;pointer-events:none}
+.sp{display:flex;align-items:center;gap:5px;margin-left:auto;font-size:11px;color:#64748b;font-family:'JetBrains Mono',monospace}
+input[type=range]{width:70px;accent-color:#4f9eff}
+.sbrow{display:flex;gap:5px;margin-top:9px;flex-wrap:wrap;align-items:center}
+.sblbl{font-size:10px;color:#64748b;font-family:'JetBrains Mono',monospace}
+.sbtn2{width:30px;height:30px;border-radius:50%;border:1.5px solid #1f2d45;cursor:pointer;
+  background:#111827;color:#64748b;font-size:10px;font-family:'JetBrains Mono',monospace;
+  transition:all .2s;display:flex;align-items:center;justify-content:center}
+.sbtn2:hover{border-color:#4f9eff;color:#4f9eff}
+.sbtn2.active{border-color:#4f9eff;color:#4f9eff;background:rgba(79,158,255,.18);box-shadow:0 0 8px rgba(79,158,255,.3)}
+.sbtn2.done{border-color:#34d399;color:#34d399;background:rgba(52,211,153,.1)}
+.ibox{margin-top:9px;background:#111827;border:1px solid #1f2d45;border-radius:10px;
+  padding:11px 14px;display:grid;grid-template-columns:auto 1fr;gap:0 12px;align-items:start}
+.ie{font-size:1.4rem;padding-top:2px}
+.ititle{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:600;color:#e2e8f0;margin-bottom:3px}
+.idesc{font-size:11px;color:#64748b;line-height:1.75}
+.toprow{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.atitle{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;
+  color:#4f9eff;letter-spacing:.06em;text-transform:uppercase}
+.sctr{font-family:'JetBrains Mono',monospace;font-size:11px;color:#64748b;
+  border:1px solid #1f2d45;border-radius:20px;padding:3px 10px}
+.leg{display:flex;gap:10px;margin-top:8px;flex-wrap:wrap}
+.li{display:flex;align-items:center;gap:4px;font-size:10px;color:#64748b;font-family:'JetBrains Mono',monospace}
+.ld{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+</style>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+"""
+
+def anim_shell(title_str, legend_items, step_count):
+    dots = "".join(f'<div class="sbtn2" id="sd{i}" onclick="jumpTo({i})">{i+1}</div>'
+                   for i in range(step_count))
+    leg  = "".join(f'<div class="li"><div class="ld" style="background:{c}"></div>{n}</div>'
+                   for n, c in legend_items)
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">{ANIM_CSS}</head><body>
+<div class="toprow">
+  <span class="atitle">{title_str}</span>
+  <span class="sctr">Step <span id="sctr">1/{step_count}</span></span>
+</div>
+<canvas id="cvs"></canvas>
+<div class="ctrl">
+  <button class="cbtn pri" id="bplay">⏸ Pause</button>
+  <button class="cbtn" id="bprev" disabled>← Prev</button>
+  <button class="cbtn" id="bnext">Next →</button>
+  <button class="cbtn" id="breset">↺ Reset</button>
+  <div class="sp">Speed <input type="range" id="spd" min="0.5" max="3" step="0.5" value="1">
+    <span id="sl">1×</span></div>
+</div>
+<div class="sbrow"><span class="sblbl">Jump →</span><div id="dotrow">{dots}</div></div>
+<div class="ibox"><div class="ie" id="ie">🖼️</div>
+  <div><div class="ititle" id="ititle">Loading…</div>
+       <div class="idesc"  id="idesc"></div></div></div>
+<div class="leg">{leg}</div>
+</body></html>"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PERCEPTRON ANIMATION
+# ═══════════════════════════════════════════════════════════════════
+def build_perceptron_anim(px28, true_label, pred_label, probs):
+    data = (
+        "<script>\n"
+        f"const PX={json.dumps(px28.tolist())};\n"
+        f"const PROBS={json.dumps([round(float(p),4) for p in probs])};\n"
+        f"const PRED={int(pred_label)};\n"
+        f"const TRUE={int(true_label) if true_label is not None else -1};\n"
+        f"const OK={'true' if true_label is not None and pred_label==true_label else 'false'};\n"
+        "</script>\n"
+    )
+    js = r"""
+<script>
+const cv=document.getElementById('cvs'),ct=cv.getContext('2d');
+let W,H;
+function resizeCanvas(){
+  W=Math.min(cv.parentElement.clientWidth-28, 1100);
+  H=Math.round(W*0.49);
+  cv.width=W; cv.height=H;
+  cv.style.height=H+'px';
+  const total=H+260;
+  document.body.style.minHeight=total+'px';
+  try{window.parent.postMessage({type:'streamlit:setFrameHeight',height:total},'*')}catch(e){}
+}
+window.addEventListener('load',()=>{resizeCanvas();});
+window.addEventListener('resize',()=>{resizeCanvas();if(typeof render==='function')render(step,prog);});
+resizeCanvas();
+const P={
+  bg:'#080d16',surf:'#0f1623',surf2:'#15202e',brd:'#1e2f44',
+  blue:'#4f9eff',cyan:'#22d3ee',green:'#34d399',yellow:'#fbbf24',
+  orange:'#fb923c',pink:'#f472b6',purple:'#a78bfa',red:'#f87171',
+  text:'#e2e8f0',muted:'#64748b',dark:'#040810'
+};
+const STEP_DUR=4.0;
+let step=0,running=true,playAll=true,prog=0,lastTs=0,speed=1,raf=null;
+let rngSeed=42;
+function rng(){rngSeed=(rngSeed*1664525+1013904223)&0xffffffff;return(rngSeed>>>0)/0xffffffff}
+const trueLabel=TRUE>=0?('True: '+TRUE):'(drawn)';
+const STEPS=[
+  {e:'🖼️',n:'Step 1 — Raw Input Image  (784 pixels)',col:P.blue,
+   d:'The Perceptron receives the 28×28 image FLATTENED into a 1D vector of 784 values (0–255). Every pixel is a separate input neuron. Unlike CNN, there is no spatial awareness — position of strokes is ignored.'},
+  {e:'⚖️',n:'Step 2 — Normalise  (÷ 255)',col:P.cyan,
+   d:'Each of the 784 pixel values is divided by 255. Values become floats in [0.0, 1.0]. Equal scale prevents any bright pixel from dominating the weighted sum in the next layer.'},
+  {e:'🔗',n:'Step 3 — Weighted Connections  (784 → 1 neuron)',col:P.purple,
+   d:'Every input neuron sends its value along a learned weight. Watch the glowing pulses travel from inputs to the centre neuron. Each pulse carries: value × weight. Brighter = stronger signal.'},
+  {e:'⚡',n:'Step 4 — Activation Function  (Sigmoid)',col:P.orange,
+   d:'The neuron sums all 784 weighted signals: z = Σ(wᵢ·xᵢ) + b. Then applies Sigmoid: σ(z) = 1/(1+e⁻ᶻ), squashing the result to (0,1). This introduces the non-linearity needed for classification.'},
+  {e:'🎯',n:'Step 5 — Output Layer  (10 neurons → Softmax)',col:P.green,
+   d:'10 output neurons — one per digit. The activated signal fans out to all 10. Softmax converts raw scores to probabilities summing to 1.0. The highest bar is the Perceptron\'s answer.'}
+];
+function lerp(a,b,t){return a+(b-a)*t}
+function clamp(v,lo,hi){return Math.max(lo,Math.min(hi,v))}
+function eOut(t){return 1-Math.pow(1-clamp(t,0,1),3)}
+function eInOut(t){t=clamp(t,0,1);return t<.5?4*t*t*t:(t-1)*(2*t-2)*(2*t-2)+1}
+function eBounce(t){t=clamp(t,0,1);if(!t||t===1)return t;return Math.pow(2,-10*t)*Math.sin((t*10-.75)*(2*Math.PI/3))+1}
+function rgba(h,a){const r=parseInt(h.slice(1,3),16),g=parseInt(h.slice(3,5),16),b=parseInt(h.slice(5,7),16);return `rgba(${r},${g},${b},${a})`}
+function rr(x,y,w,h,r){ct.beginPath();ct.moveTo(x+r,y);ct.lineTo(x+w-r,y);ct.arcTo(x+w,y,x+w,y+r,r);ct.lineTo(x+w,y+h-r);ct.arcTo(x+w,y+h,x+w-r,y+h,r);ct.lineTo(x+r,y+h);ct.arcTo(x,y+h,x,y+h-r,r);ct.lineTo(x,y+r);ct.arcTo(x,y,x+r,y,r);ct.closePath();}
+function txt(s,x,y,col,sz,align,font){sz=sz||11;align=align||'center';font=font||"'JetBrains Mono',monospace";ct.font=`${sz}px ${font}`;ct.fillStyle=col;ct.textAlign=align;ct.fillText(s,x,y);}
+function badge(s,x,y,col,sz){sz=sz||11;ct.font=`${sz}px 'JetBrains Mono',monospace`;const tw=ct.measureText(s).width,bw=tw+18,bh=sz+11;ct.fillStyle=rgba(col,.16);ct.strokeStyle=rgba(col,.55);ct.lineWidth=.9;rr(x-bw/2,y-bh/2,bw,bh,bh/2);ct.fill();ct.stroke();ct.fillStyle=col;ct.textAlign='center';ct.fillText(s,x,y+sz*.35);}
+function lbl(s,x,y,col,sz){sz=sz||10;ct.font=`${sz}px 'JetBrains Mono',monospace`;const tw=ct.measureText(s).width;ct.fillStyle=rgba(P.dark,.82);rr(x-tw/2-5,y-sz-2,tw+10,sz+7,3);ct.fill();ct.fillStyle=col;ct.textAlign='center';ct.fillText(s,x,y);}
+function glow(x,y,r,col,intensity){ct.shadowColor=rgba(col,intensity);ct.shadowBlur=r*3;ct.beginPath();ct.arc(x,y,r,0,Math.PI*2);ct.fillStyle=rgba(col,intensity*.4);ct.fill();ct.strokeStyle=rgba(col,intensity*.9);ct.lineWidth=1.2;ct.stroke();ct.shadowBlur=0;}
+function arrowDash(x1,y1,x2,y2,col,alpha,thick){thick=thick||2;ct.strokeStyle=rgba(col,alpha*.85);ct.lineWidth=thick;ct.setLineDash([6,4]);ct.beginPath();ct.moveTo(x1,y1);ct.lineTo(x2,y2);ct.stroke();ct.setLineDash([]);const ang=Math.atan2(y2-y1,x2-x1);ct.fillStyle=rgba(col,alpha);ct.beginPath();ct.moveTo(x2,y2);ct.lineTo(x2-11*Math.cos(ang-.4),y2-11*Math.sin(ang-.4));ct.lineTo(x2-11*Math.cos(ang+.4),y2-11*Math.sin(ang+.4));ct.closePath();ct.fill();}
+function formulaBox(x,y,w,h,col,alpha,lines){ct.fillStyle=rgba(P.surf2,alpha*.96);ct.strokeStyle=rgba(col,alpha*.5);ct.lineWidth=.9;rr(x,y,w,h,8);ct.fill();ct.stroke();ct.fillStyle=rgba(col,alpha*.8);rr(x,y,3,h,2);ct.fill();lines.forEach((ln,i)=>{txt(ln.t,x+w/2,y+18+i*19,rgba(ln.c||col,alpha*(ln.a||1)),ln.s||11);});}
+function drawDigit(cx,cy,cs,alpha,warmth){warmth=warmth||0;for(let r=0;r<28;r++)for(let c=0;c<28;c++){const v=PX[r][c];const px=cx+(c-14)*cs+cs*.5,py=cy+(r-14)*cs+cs*.5;if(v>.04){const vi=Math.min(v*1.3,1);ct.fillStyle=warmth>0?`rgba(${Math.round(lerp(79,251,vi*warmth))},${Math.round(lerp(158,191,vi*warmth))},${Math.round(lerp(255,36,vi*warmth))},${alpha})`:`rgba(${Math.round(lerp(15,79,vi))},${Math.round(lerp(30,158,vi))},${Math.round(lerp(50,255,vi))},${alpha})`;}else ct.fillStyle=`rgba(12,18,28,${alpha})`;ct.fillRect(px,py,cs-.5,cs-.5);}}
+function thumb(alpha){const ts=4.0,tx=54,ty=H/2+12;ct.fillStyle=rgba(P.surf2,.96);rr(tx-ts*14-5,ty-ts*14-5,ts*28+10,ts*28+10,7);ct.fill();ct.shadowColor=rgba(P.blue,.2);ct.shadowBlur=14;ct.strokeStyle=rgba(P.brd,.8);ct.lineWidth=.9;rr(tx-ts*14-5,ty-ts*14-5,ts*28+10,ts*28+10,7);ct.stroke();ct.shadowBlur=0;drawDigit(tx,ty,ts,alpha,0);lbl('Input digit',tx,ty+ts*14+16,P.muted,9);badge(trueLabel,tx,ty+ts*14+34,P.yellow,10);}
+const INP_X=185,HID_X=440,OUT_X=680;
+const CY=H/2+10,N_INP=16,N_OUT=10,SP_INP=22,SP_OUT=22;
+function inpY(i){return CY+(i-N_INP/2+.5)*SP_INP;}
+function outY(i){return CY+(i-N_OUT/2+.5)*SP_OUT;}
+function drawInputLayer(alpha,pulsePhase){for(let i=0;i<N_INP;i++){const y=inpY(i);const row=Math.floor(i*28/N_INP),col2=14;const v=PX[row][col2];const intensity=clamp(v*1.3,0,1)*alpha;if(intensity>.05)glow(INP_X,y,9,P.blue,intensity*.7);else{ct.beginPath();ct.arc(INP_X,y,9,0,Math.PI*2);ct.fillStyle=rgba(P.blue,alpha*.1);ct.fill();ct.strokeStyle=rgba(P.blue,alpha*.4);ct.lineWidth=.9;ct.stroke();}}lbl('x₁',INP_X-22,inpY(0)+4,P.muted,9);lbl('x₂',INP_X-22,inpY(1)+4,P.muted,9);lbl('⋮',INP_X-22,CY+2,P.muted,13);lbl('x₇₈₄',INP_X-26,inpY(N_INP-1)+4,P.muted,9);badge('784 inputs',INP_X,inpY(N_INP-1)+26,P.blue,10);}
+function drawWires(srcX,srcYFn,nSrc,dstX,dstYFn,nDst,baseAlpha,flowProg,pulseCol,frameSeed){rngSeed=frameSeed;for(let i=0;i<nSrc;i++){const sy=srcYFn(i);for(let j=0;j<nDst;j++){const dy=dstYFn(j);const wStrength=Math.abs(Math.sin(i*1.4+j*2.3))*.5+.2;ct.strokeStyle=rgba(pulseCol,baseAlpha*wStrength*.35);ct.lineWidth=.55;ct.beginPath();ct.moveTo(srcX+11,sy);ct.lineTo(dstX-11,dy);ct.stroke();}}if(flowProg>0){const nPulses=8;for(let k=0;k<nPulses;k++){const i=Math.floor(rng()*nSrc),j=Math.floor(rng()*nDst);const phaseOffset=rng();const t=((flowProg*2+phaseOffset)%1);const sy=srcYFn(i),dy=dstYFn(j);const px2=lerp(srcX+11,dstX-11,t),py2=lerp(sy,dy,t);const weight=Math.abs(Math.sin(i*1.4+j*2.3))*.6+.4;ct.shadowColor=rgba(pulseCol,.8);ct.shadowBlur=8;ct.beginPath();ct.arc(px2,py2,3.2,0,Math.PI*2);ct.fillStyle=rgba(pulseCol,clamp(weight*flowProg*1.2,0,1));ct.fill();ct.shadowBlur=0;}}}
+function drawHiddenNeuron(alpha,activated){const intensity=activated?alpha:alpha*.5;ct.shadowColor=rgba(P.purple,intensity*.5);ct.shadowBlur=20;ct.beginPath();ct.arc(HID_X,CY,24,0,Math.PI*2);ct.fillStyle=rgba(P.purple,intensity*.45);ct.fill();ct.strokeStyle=rgba(P.purple,intensity*.95);ct.lineWidth=2.5;ct.stroke();ct.shadowBlur=0;txt('Σ',HID_X,CY+7,rgba(P.purple,intensity),18);lbl('Weighted sum',HID_X,CY+42,P.purple,10);}
+function drawOutputLayer(alpha){for(let i=0;i<N_OUT;i++){const y=outY(i),active=i===PRED;if(active)glow(OUT_X,y,11,P.green,alpha);else{ct.beginPath();ct.arc(OUT_X,y,10,0,Math.PI*2);ct.fillStyle=rgba(P.purple,alpha*.15);ct.fill();ct.strokeStyle=rgba(P.purple,alpha*.5);ct.lineWidth=.9;ct.stroke();}ct.font="9px 'JetBrains Mono',monospace";ct.fillStyle=rgba(active?P.green:P.muted,alpha);ct.textAlign='left';ct.fillText(String(i),OUT_X+15,y+3.5);}badge('10 outputs',OUT_X,outY(N_OUT-1)+24,P.purple,10);}
+function topBar(p,col){ct.fillStyle=rgba(P.brd,.6);rr(14,6,W-28,5,2);ct.fill();if(p>0){ct.fillStyle=col;rr(14,6,(W-28)*clamp(p,0,1),5,2);ct.fill();}}
+function header(s,p){const a=eOut(p*3),st=STEPS[s];ct.fillStyle=rgba(st.col,.08);rr(14,18,W-28,48,8);ct.fill();ct.strokeStyle=rgba(st.col,.22);ct.lineWidth=.9;rr(14,18,W-28,48,8);ct.stroke();badge(st.e,55,40,st.col,12);ct.font="bold 13px 'Space Grotesk',sans-serif";ct.fillStyle=rgba(P.text,a);ct.textAlign='left';ct.fillText(st.n,90,44);ct.font="10px 'JetBrains Mono',monospace";ct.fillStyle=rgba(st.col,a*.85);ct.textAlign='right';ct.fillText('Perceptron  ·  Single-Layer Classifier',W-22,44);}
+function rS0(p){const cs=lerp(0,10,eBounce(clamp(p*1.6,0,1))),fade=eOut(p*2.5);if(cs>.5)drawDigit(W/2-20,H/2,cs,clamp(fade,0,1),0);if(p>.35){const ga=eOut((p-.35)/.65);ct.strokeStyle=rgba(P.brd,ga*.55);ct.lineWidth=.35;const gx=W/2-20-14*cs,gy=H/2-14*cs;for(let i=0;i<=28;i++){ct.beginPath();ct.moveTo(gx+i*cs,gy);ct.lineTo(gx+i*cs,gy+28*cs);ct.stroke();ct.beginPath();ct.moveTo(gx,gy+i*cs);ct.lineTo(gx+28*cs,gy+i*cs);ct.stroke();}if(p>.65){const aa=eOut((p-.65)/.35);const r2=6,c2=10,pv=Math.round(PX[r2][c2]*255);const px2=gx+c2*cs,py2=gy+r2*cs;ct.strokeStyle=rgba(P.yellow,aa*.9);ct.lineWidth=1.5;rr(px2,py2,cs,cs,1);ct.stroke();formulaBox(W/2+14*cs+20,H/2-16,200,50,P.yellow,aa,[{t:`pixel[${r2}][${c2}] = ${pv}`,c:P.yellow,s:11},{t:'→ one input neuron value',c:P.muted,s:10,a:.8}]);}}badge('28 × 28  =  784 input neurons',W/2-20,H/2+14*cs+30,P.blue,12);badge(trueLabel,W/2-20,H/2+14*cs+50,P.yellow,12);if(p>.55){const ca=eOut((p-.55)/.45);formulaBox(14,H/2+14*cs+64,W-28,36,P.orange,ca,[{t:'⚠  No spatial info — Perceptron cannot tell WHERE strokes appear in the image',c:P.orange,s:10}]);}}
+function rS1(p){
+  const a=eOut(p);
+  const zoneW=W/3;
+  const leftX=zoneW*0.5;
+  const midX=zoneW*1.5;
+  const rightX=zoneW*2.5;
+  const cs=8, halfPx=cs*14;
+
+  drawDigit(leftX,H/2,cs,clamp(a,0,1),0);
+  lbl('Raw  (0–255)',leftX,H/2+halfPx+14,P.muted,10);
+  badge('uint8',leftX,H/2+halfPx+30,P.muted,10);
+
+  if(p>.25){
+    const fa=eOut((p-.25)/.75);
+    const fbW=Math.min(210,zoneW-20), fbH=54;
+    formulaBox(midX-fbW/2,H/2-fbH/2,fbW,fbH,P.cyan,fa,[
+      {t:'pixel  ÷  255.0',c:P.cyan,s:17},
+      {t:'→ range  [ 0.0 … 1.0 ]',c:P.muted,s:10,a:.8}
+    ]);
+    const arrowX1=leftX+halfPx+10, arrowX2=midX-fbW/2-8;
+    if(arrowX2>arrowX1+20) arrowDash(arrowX1,H/2,arrowX2,H/2,P.cyan,fa,2.5);
+  }
+
+  if(p>.45){
+    const wa=eOut((p-.45)/.55);
+    drawDigit(rightX,H/2,cs,clamp(a,0,1),wa);
+    lbl('Normalised  (0.0–1.0)',rightX,H/2+halfPx+14,P.cyan,10);
+    badge('float32  shape (1, 784)',rightX,H/2+halfPx+30,P.cyan,10);
+  }
+
+  if(p>.72){
+    const ca=eOut((p-.72)/.28);
+    formulaBox(14,H/2+halfPx+48,W-28,38,P.cyan,ca,[
+      {t:'WHY? Equal scale → gradients stay manageable → faster, more stable training',c:P.cyan,s:10}
+    ]);
+  }
+}
+function rS2(p){const a=eOut(p);thumb(clamp(a,0,1));drawInputLayer(a,p*6);const flowProg=clamp((p-.15)/.85,0,1);const frameSeed=Math.floor(prog*1000+step*997)&0xffffffff;drawWires(INP_X,inpY,N_INP,HID_X,(i)=>CY,1,a,flowProg,P.purple,frameSeed);if(p>.1)drawHiddenNeuron(eOut((p-.1)/.9),false);if(p>.45){const fa=eOut((p-.45)/.55);formulaBox(520,CY-64,310,80,P.purple,fa,[{t:'z = w₁x₁ + w₂x₂ + … + w₇₈₄x₇₈₄ + b',c:P.purple,s:10},{t:'= dot( weights, inputs ) + bias',c:P.yellow,s:10,a:.9},{t:'weights shape: (784,)  —  785 params total',c:P.muted,s:9,a:.8}]);}lbl('Weight on each wire',lerp(INP_X,HID_X,.5),CY-95,P.purple,9);}
+function rS3(p){const a=eOut(p);thumb(clamp(a,0,1));drawInputLayer(a*.35,0);const fs2=Math.floor(prog*800+step*997)&0xffffffff;drawWires(INP_X,inpY,N_INP,HID_X,(i)=>CY,1,a*.3,a*.4,P.purple,fs2);drawHiddenNeuron(a*.5,false);if(p>.2){const fa=eOut((p-.2)/.8);arrowDash(HID_X+25,CY,HID_X+90,CY,P.orange,fa,2.5);formulaBox(HID_X+94,CY-60,228,124,P.orange,fa,[{t:'σ(z) = 1 / (1 + e⁻ᶻ)',c:P.yellow,s:13},{t:'Sigmoid activation',c:P.orange,s:10,a:.85},{t:'squashes any z  →  (0.0, 1.0)',c:P.muted,s:9,a:.8}]);if(fa>.45){const ca=eOut((fa-.45)/.55);const bx=HID_X+94+112,by=CY+12,cw=172,ch=24;ct.strokeStyle=rgba(P.orange,ca*.9);ct.lineWidth=2;ct.setLineDash([]);ct.beginPath();for(let xi=0;xi<=cw;xi++){const zv=(xi/cw)*12-6,sv=1/(1+Math.exp(-zv));const px2=bx-cw/2+xi,py2=by-sv*ch+ch*.5;xi===0?ct.moveTo(px2,py2):ct.lineTo(px2,py2);}ct.stroke();ct.strokeStyle=rgba(P.brd,.4);ct.lineWidth=.5;ct.beginPath();ct.moveTo(bx-cw/2,by);ct.lineTo(bx+cw/2,by);ct.stroke();lbl('Sigmoid curve',bx,by+16,P.orange,8);}}if(p>.7){const ca=eOut((p-.7)/.3);formulaBox(14,H/2+148,W-28,38,P.cyan,ca,[{t:'WHY? Without activation: stacking layers = still just linear. Activation = non-linear learning power.',c:P.cyan,s:10}]);}}
+function rS4(p){
+  const a=eOut(p);
+  thumb(clamp(a,0,1));
+  drawInputLayer(a*.2,0);
+  const fs3=Math.floor(prog*600+step*997)&0xffffffff;
+  drawWires(INP_X,inpY,N_INP,HID_X,(i)=>CY,1,a*.2,0,P.purple,fs3);
+  drawHiddenNeuron(a*.35,true);
+  const flowOut=clamp((p-.1)/.9,0,1);
+  const fs4=Math.floor(prog*700+step*997+77)&0xffffffff;
+  drawWires(HID_X,(i)=>CY,1,OUT_X,outY,N_OUT,a*.7,flowOut,P.green,fs4);
+  drawOutputLayer(a);
+
+  // ── BAR CHART: positioned BELOW the network row, centred in available width ──
+  // bx starts at 28% of canvas width (safe zone after the thumb thumbnail)
+  // by is CY+82 — clearly below the neuron row, no vertical collision
+  // bw fills remaining width responsively; bh shortened to fit neatly below
+  if(p>.18){
+    const ba=eOut((p-.18)/.82);
+    const bx=Math.round(W*0.28);
+    const by=CY+82;
+    const bw=Math.min(320,W-bx-20);
+    const bh=110;
+    const bw2=bw/10;
+    for(let i=0;i<10;i++){
+      const bh2=PROBS[i]*bh,x=bx+i*bw2+1.5;
+      const col=i===PRED?P.green:(i===TRUE?P.blue:P.muted);
+      ct.fillStyle=rgba(col,(i===PRED?.92:.28)*ba);
+      rr(x,by+bh-bh2,bw2-3,bh2,2);
+      ct.fill();
+      ct.font="9px 'JetBrains Mono',monospace";
+      ct.fillStyle=rgba(col,ba);
+      ct.textAlign='center';
+      ct.fillText(String(i),x+(bw2-3)/2,by+bh+12);
+      if(i===PRED){
+        ct.fillStyle=rgba(P.green,ba);
+        ct.fillText(Math.round(PROBS[i]*100)+'%',x+(bw2-3)/2,by+bh-bh2-6);
+      }
+    }
+    ct.strokeStyle=rgba(P.muted,.28);
+    ct.lineWidth=.5;
+    ct.beginPath();
+    ct.moveTo(bx,by+bh);
+    ct.lineTo(bx+bw,by+bh);
+    ct.stroke();
+    badge('Prediction: '+PRED,bx+bw/2,by+bh+28,P.green,11);
+  }
+
+  if(p>.62){
+    const va=eBounce(clamp((p-.62)/.38,0,1)),vc=OK?P.green:P.orange;
+    ct.shadowColor=rgba(vc,.45);ct.shadowBlur=22;
+    ct.fillStyle=rgba(P.dark,.96);
+    rr(OUT_X+30,CY-65,140,132,12);ct.fill();
+    ct.shadowBlur=0;
+    ct.strokeStyle=rgba(vc,va*.92);ct.lineWidth=2.5;
+    rr(OUT_X+30,CY-65,140,132,12);ct.stroke();
+    ct.font="bold 52px 'JetBrains Mono',monospace";
+    ct.fillStyle=rgba(vc,va);ct.textAlign='center';
+    ct.fillText(String(PRED),OUT_X+100,CY+14);
+    txt(OK?'✓ CORRECT':'✗ WRONG',OUT_X+100,CY+42,rgba(vc,va*.92),10);
+    txt(Math.round(PROBS[PRED]*100)+'% conf',OUT_X+100,CY+56,rgba(vc,va*.8),9);
+    txt(trueLabel,OUT_X+100,CY+70,rgba(P.muted,va*.7),9);
+    if(OK&&va>.5)for(let i=0;i<20;i++){
+      const ang=(i/20)*Math.PI*2,d=50+i*3;
+      const cx2=OUT_X+100+Math.cos(ang)*d*(va-.42)*1.9;
+      const cy2=CY+2+Math.sin(ang)*d*(va-.42)*1.3;
+      ct.fillStyle=rgba([P.green,P.yellow,P.cyan,P.pink,P.purple,P.orange][i%6],clamp((va-.5)*2,0,1)*.85);
+      ct.beginPath();ct.arc(cx2,cy2,3.5,0,Math.PI*2);ct.fill();
+    }
+  }
+}
+const RENDERS=[rS0,rS1,rS2,rS3,rS4];
+function render(s,p){ct.fillStyle=P.bg;ct.fillRect(0,0,W,H);topBar(p,STEPS[s].col);header(s,p);rngSeed=(Math.floor(p*9999)+s*1234+Date.now()*.001)&0xffffffff;ct.save();ct.translate(0,74);RENDERS[s](p);ct.restore();}
+function loop(ts){if(!running){raf=null;return}const dt=Math.min((ts-lastTs)/1000,.05)*speed;lastTs=ts;prog=Math.min(prog+dt/STEP_DUR,1);render(step,prog);updateUI();if(prog>=1){if(playAll&&step<4){running=false;setTimeout(()=>{step++;prog=0;running=true;lastTs=performance.now();raf=requestAnimationFrame(loop);updateBtns()},750/speed);}else{running=false;playAll=false;updateBtns();raf=null;}}else raf=requestAnimationFrame(loop);}
+function startAnim(){if(raf)cancelAnimationFrame(raf);running=true;lastTs=performance.now();raf=requestAnimationFrame(loop)}
+function updateUI(){document.getElementById('sctr').textContent=(step+1)+'/5';const s=STEPS[step];document.getElementById('ie').textContent=s.e;document.getElementById('ititle').textContent=s.n;document.getElementById('idesc').textContent=s.d;for(let i=0;i<5;i++){const d=document.getElementById('sd'+i);if(d)d.className='sbtn2'+(i===step?' active':(i<step?' done':''));}}
+function updateBtns(){document.getElementById('bprev').disabled=step===0;document.getElementById('bnext').disabled=step===4&&prog>=1;const pl=running&&playAll;document.getElementById('bplay').textContent=pl?'⏸ Pause':'▶ Play All';document.getElementById('bplay').className='cbtn'+(pl?'':' pri');}
+function jumpTo(i){if(raf)cancelAnimationFrame(raf);step=i;prog=0;running=true;playAll=false;startAnim();updateBtns()}
+document.getElementById('bplay').onclick=()=>{if(running&&playAll){running=false;playAll=false;updateBtns();return}if(step===4&&prog>=1){step=0;prog=0}playAll=true;startAnim();updateBtns();};
+document.getElementById('bnext').onclick=()=>{step=Math.min(step+1,4);prog=0;playAll=false;startAnim();updateBtns()};
+document.getElementById('bprev').onclick=()=>{step=Math.max(step-1,0);prog=0;playAll=false;startAnim();updateBtns()};
+document.getElementById('breset').onclick=()=>{if(raf)cancelAnimationFrame(raf);running=false;playAll=false;step=0;prog=0;render(0,0);updateUI();updateBtns()};
+document.getElementById('spd').oninput=function(){speed=parseFloat(this.value);document.getElementById('sl').textContent=speed+'×'};
+startAnim();updateUI();updateBtns();
+</script>"""
+    shell = anim_shell("🔵 Perceptron — Forward Pass",
+                       [("Input  784","#4f9eff"),("Weights","#a78bfa"),
+                        ("Activation","#fb923c"),("Output  10","#34d399")], 5)
+    return shell.replace("</body></html>", data + js + "</body></html>")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ANN ANIMATION
+# ═══════════════════════════════════════════════════════════════════
+def build_ann_anim(px28, true_label, pred_label, probs):
+    data = (
+        "<script>\n"
+        f"const PX={json.dumps(px28.tolist())};\n"
+        f"const PROBS={json.dumps([round(float(p),4) for p in probs])};\n"
+        f"const PRED={int(pred_label)};\n"
+        f"const TRUE={int(true_label) if true_label is not None else -1};\n"
+        f"const OK={'true' if true_label is not None and pred_label==true_label else 'false'};\n"
+        "</script>\n"
+    )
+    js = r"""
+<script>
+const cv = document.getElementById('cvs'), ct = cv.getContext('2d');
+let W, H;
+
+/* ── KEY FIX: CY and layer geometry are FUNCTIONS, not constants ──
+   The old code had  const CY = H/2+10  at top-level, which evaluated
+   before resizeCanvas() ever set H, so CY was NaN → everything shifted
+   to the top of the canvas.  Now CY() reads the live H each frame.    */
+const SP = 24;
+function CY() { return Math.round(H * 0.52); }
+
+/* Layer x-positions are also computed from W so they never clip */
+function getLayers() {
+  const pad = 130, span = W - pad - 70;
+  return [
+    { x: pad,              n: 12, col: P.blue,   name: 'Input',    sub: '784' },
+    { x: pad + span*0.33,  n: 10, col: P.purple, name: 'Hidden 1', sub: '128, ReLU' },
+    { x: pad + span*0.66,  n:  9, col: P.pink,   name: 'Hidden 2', sub: '64, ReLU' },
+    { x: pad + span,       n:  9, col: P.green,  name: 'Output',   sub: '10, Softmax' }
+  ];
+}
+
+function resizeCanvas() {
+  W = Math.min(cv.parentElement.clientWidth - 20, 1100);
+  H = Math.round(W * 0.50);
+  cv.width  = W;
+  cv.height = H;
+  cv.style.height = H + 'px';
+  const total = H + 300;
+  document.body.style.minHeight = total + 'px';
+  try { window.parent.postMessage({ type: 'streamlit:setFrameHeight', height: total }, '*'); } catch(e) {}
+}
+window.addEventListener('load',   () => { resizeCanvas(); startAnim(); updateUI(); updateBtns(); });
+window.addEventListener('resize', () => { resizeCanvas(); if (typeof render === 'function') render(step, prog); });
+resizeCanvas();
+
+/* ── PALETTE ── */
+const P = {
+  bg:'#06090f', surf:'#0c1220', surf2:'#101828', brd:'#182438',
+  blue:'#4f9eff', cyan:'#22d3ee', green:'#34d399', yellow:'#fbbf24',
+  orange:'#fb923c', pink:'#f472b6', purple:'#a78bfa', red:'#f87171',
+  text:'#e2e8f0', muted:'#4a6080', dark:'#030608'
+};
+
+const STEP_DUR = 4.5;
+let step = 0, running = false, playAll = false, prog = 0, lastTs = 0, speed = 1, raf = null;
+const trueLabel = TRUE >= 0 ? ('True: ' + TRUE) : '(drawn)';
+
+const STEPS = [
+  { e:'🖼️', n:'Step 1 — Input Image  (784 neurons)',         col: P.blue,
+    d:'The 28×28 pixel image is flattened into 784 input values. Each neuron holds ONE normalised pixel (0.0–1.0). No spatial awareness — every pixel is treated independently.' },
+  { e:'⚖️', n:'Step 2 — Normalise  (÷ 255)',                 col: P.cyan,
+    d:'Raw integers (0–255) are divided by 255. All inputs now live in [0.0, 1.0]. Equal scale prevents any single bright pixel from dominating the weighted sums in later layers.' },
+  { e:'🧠', n:'Step 3 — Hidden Layer 1  (128 neurons, ReLU)',col: P.purple,
+    d:'Each of 128 neurons receives ALL 784 inputs, computes z = Σ(wᵢ·xᵢ) + b, then fires ReLU: max(0,z). Bright neurons = strong positive activation. Dark = zeroed by ReLU.' },
+  { e:'🔁', n:'Step 4 — Hidden Layer 2  (64 neurons, ReLU)', col: P.pink,
+    d:'64 deeper neurons receive all 128 Hidden-1 outputs. They detect combinations of combinations — higher-order patterns. Signal flows right through the glowing connections.' },
+  { e:'💧', n:'Step 5 — Dropout  (50 % zeroed during training)', col: P.orange,
+    d:'During training ~50 % of neurons are randomly disabled (shown as ✕). This forces the network to learn redundant representations, preventing over-reliance on any single neuron.' },
+  { e:'🎯', n:'Step 6 — Output Layer  (10 neurons → Softmax)', col: P.green,
+    d:'10 output neurons — one per digit. Softmax converts raw scores to probabilities summing to 1.0. The tallest bar is the predicted class. Watch the answer box appear!' }
+];
+
+/* ── MATH HELPERS ── */
+const lerp  = (a, b, t) => a + (b - a) * t;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const eOut  = t => { t = clamp(t,0,1); return 1 - Math.pow(1-t, 3); };
+const eBounce = t => {
+  t = clamp(t,0,1);
+  if (!t || t===1) return t;
+  return Math.pow(2,-10*t) * Math.sin((t*10-.75)*(2*Math.PI/3)) + 1;
+};
+
+function rgba(h, a) {
+  return `rgba(${parseInt(h.slice(1,3),16)},${parseInt(h.slice(3,5),16)},${parseInt(h.slice(5,7),16)},${a})`;
+}
+function rr(x, y, w, h, r) {
+  ct.beginPath(); ct.moveTo(x+r,y); ct.lineTo(x+w-r,y);
+  ct.arcTo(x+w,y,x+w,y+r,r); ct.lineTo(x+w,y+h-r);
+  ct.arcTo(x+w,y+h,x+w-r,y+h,r); ct.lineTo(x+r,y+h);
+  ct.arcTo(x,y+h,x,y+h-r,r); ct.lineTo(x,y+r);
+  ct.arcTo(x,y,x+r,y,r); ct.closePath();
+}
+function txt(s, x, y, col, sz, align) {
+  sz = sz||11; align = align||'center';
+  ct.font = `${sz}px 'JetBrains Mono',monospace`;
+  ct.fillStyle = col; ct.textAlign = align; ct.fillText(s, x, y);
+}
+function badge(s, x, y, col, sz) {
+  sz = sz||11;
+  ct.font = `${sz}px 'JetBrains Mono',monospace`;
+  const tw = ct.measureText(s).width, bw = tw+18, bh = sz+11;
+  ct.fillStyle = rgba(col,.16); ct.strokeStyle = rgba(col,.55); ct.lineWidth = .9;
+  rr(x-bw/2, y-bh/2, bw, bh, bh/2); ct.fill(); ct.stroke();
+  ct.fillStyle = col; ct.textAlign = 'center'; ct.fillText(s, x, y+sz*.35);
+}
+function lbl(s, x, y, col, sz) {
+  sz = sz||10;
+  ct.font = `${sz}px 'JetBrains Mono',monospace`;
+  const tw = ct.measureText(s).width;
+  ct.fillStyle = rgba(P.dark,.85);
+  rr(x-tw/2-5, y-sz-2, tw+10, sz+7, 3); ct.fill();
+  ct.fillStyle = col; ct.textAlign = 'center'; ct.fillText(s, x, y);
+}
+function glow(x, y, r, col, intensity) {
+  /* radial aura */
+  const g = ct.createRadialGradient(x,y,0, x,y,r*3.5);
+  g.addColorStop(0, rgba(col, intensity*.4));
+  g.addColorStop(1, rgba(col, 0));
+  ct.beginPath(); ct.arc(x, y, r*3.5, 0, Math.PI*2);
+  ct.fillStyle = g; ct.fill();
+  /* core */
+  ct.shadowColor = rgba(col, intensity); ct.shadowBlur = r*2.5;
+  ct.beginPath(); ct.arc(x, y, r, 0, Math.PI*2);
+  ct.fillStyle = rgba(col, intensity*.55); ct.fill();
+  ct.strokeStyle = rgba(col, intensity*.95); ct.lineWidth = 1.4; ct.stroke();
+  ct.shadowBlur = 0;
+}
+function arrowSolid(x1, y1, x2, y2, col, alpha, thick) {
+  thick = thick||2;
+  ct.strokeStyle = rgba(col, alpha*.85); ct.lineWidth = thick;
+  ct.setLineDash([6,4]);
+  ct.beginPath(); ct.moveTo(x1,y1); ct.lineTo(x2,y2); ct.stroke();
+  ct.setLineDash([]);
+  const ang = Math.atan2(y2-y1, x2-x1);
+  ct.fillStyle = rgba(col, alpha);
+  ct.beginPath();
+  ct.moveTo(x2, y2);
+  ct.lineTo(x2-11*Math.cos(ang-.4), y2-11*Math.sin(ang-.4));
+  ct.lineTo(x2-11*Math.cos(ang+.4), y2-11*Math.sin(ang+.4));
+  ct.closePath(); ct.fill();
+}
+
+/* ── DIGIT RENDERER ── */
+function drawDigit(cx, cy, cs, alpha, warmth) {
+  warmth = warmth||0;
+  for (let r=0; r<28; r++) for (let c=0; c<28; c++) {
+    const v  = PX[r][c];
+    const px = cx + (c-14)*cs + cs*.5;
+    const py = cy + (r-14)*cs + cs*.5;
+    if (v > .04) {
+      const vi = Math.min(v*1.3, 1);
+      ct.fillStyle = warmth > 0
+        ? `rgba(${Math.round(lerp(79,251,vi*warmth))},${Math.round(lerp(158,191,vi*warmth))},${Math.round(lerp(255,36,vi*warmth))},${alpha})`
+        : `rgba(${Math.round(lerp(15,79,vi))},${Math.round(lerp(30,158,vi))},${Math.round(lerp(50,255,vi))},${alpha})`;
+    } else {
+      ct.fillStyle = `rgba(8,12,20,${alpha})`;
+    }
+    ct.fillRect(px, py, cs-.5, cs-.5);
+  }
+}
+
+/* ── THUMBNAIL (top-left corner digit) ──
+   KEY FIX: ts, tx, ty all derived from live H so it never overflows  */
+function thumb(alpha) {
+  const ts = Math.min(3.8, H*0.013);
+  const tx = ts*14 + 14;
+  const ty = CY();
+  /* panel */
+  ct.fillStyle = rgba(P.surf2, .96);
+  rr(tx-ts*14-6, ty-ts*14-6, ts*28+12, ts*28+12, 9); ct.fill();
+  ct.shadowColor = rgba(P.blue,.18); ct.shadowBlur = 16;
+  ct.strokeStyle = rgba(P.brd,.85); ct.lineWidth = .9;
+  rr(tx-ts*14-6, ty-ts*14-6, ts*28+12, ts*28+12, 9); ct.stroke();
+  ct.shadowBlur = 0;
+  drawDigit(tx, ty, ts, alpha, 0);
+  lbl('Input digit', tx, ty+ts*14+16, P.muted, 9);
+  badge(trueLabel,  tx, ty+ts*14+34, P.yellow, 10);
+}
+
+/* ── LAYER HELPERS ── */
+function nyPos(layers, li, ni) {
+  const L = layers[li];
+  return CY() + (ni - L.n/2 + .5) * SP;
+}
+function drawConnections(layers, li1, li2, alpha, flowProg, highlightCol) {
+  const L1 = layers[li1], L2 = layers[li2];
+  for (let i=0; i<L1.n; i++) for (let j=0; j<L2.n; j+=2) {
+    const x1=L1.x+13, y1=nyPos(layers,li1,i);
+    const x2=L2.x-13, y2=nyPos(layers,li2,j);
+    ct.strokeStyle = rgba(L1.col, alpha*.12); ct.lineWidth = .55;
+    ct.beginPath(); ct.moveTo(x1,y1); ct.lineTo(x2,y2); ct.stroke();
+  }
+  if (flowProg > 0 && highlightCol) {
+    const t = clamp(flowProg,0,1);
+    for (let i=0; i<Math.min(L1.n,7); i++) {
+      const j  = i % L2.n;
+      const x1 = L1.x+13, y1 = nyPos(layers,li1,i);
+      const x2 = L2.x-13, y2 = nyPos(layers,li2,j);
+      const px2 = lerp(x1,x2,t), py2 = lerp(y1,y2,t);
+      ct.shadowColor = rgba(highlightCol,.9); ct.shadowBlur = 12;
+      ct.beginPath(); ct.arc(px2, py2, 3.5, 0, Math.PI*2);
+      ct.fillStyle = rgba(highlightCol,.95); ct.fill();
+      ct.shadowBlur = 0;
+    }
+  }
+}
+function drawLayer(layers, li, alpha, activeRatio, isDropout, dropoutProg, pulsePhase) {
+  const L = layers[li];
+  for (let i=0; i<L.n; i++) {
+    const x=L.x, y=nyPos(layers,li,i);
+    const phase  = Math.sin(i*1.4 + pulsePhase);
+    const active = phase > (1 - activeRatio*2 - .5);
+    const intensity = active ? clamp(alpha,0,1) : clamp(alpha*.25,0,1);
+    if (isDropout && (i%2===1) && dropoutProg>0) {
+      const dp = dropoutProg;
+      ct.strokeStyle = rgba(P.red, dp*.75); ct.lineWidth = 1.8;
+      ct.beginPath(); ct.moveTo(x-9,y-9); ct.lineTo(x+9,y+9); ct.stroke();
+      ct.beginPath(); ct.moveTo(x+9,y-9); ct.lineTo(x-9,y+9); ct.stroke();
+      ct.beginPath(); ct.arc(x,y,11,0,Math.PI*2);
+      ct.fillStyle = rgba(P.muted,alpha*.08); ct.fill();
+      ct.strokeStyle = rgba(P.muted,alpha*.22); ct.lineWidth = .9; ct.stroke();
+    } else if (active) {
+      glow(x, y, 11, L.col, intensity*.9);
+    } else {
+      ct.beginPath(); ct.arc(x,y,11,0,Math.PI*2);
+      ct.fillStyle   = rgba(L.col, intensity*.12); ct.fill();
+      ct.strokeStyle = rgba(L.col, intensity*.4);  ct.lineWidth = .9; ct.stroke();
+    }
+  }
+  if ((li===1||li===2) && alpha>.3) lbl('⋮', L.x, CY()+2, rgba(L.col,alpha*.65), 14);
+}
+function layerLabel(layers, li, alpha) {
+  const L = layers[li];
+  const bot = CY() + L.n/2*SP + 20;
+  lbl(L.name, L.x, bot,    rgba(L.col,  alpha*.95), 10);
+  lbl(L.sub,  L.x, bot+16, rgba(P.muted,alpha*.8),   9);
+}
+
+/* ── FORMULA BOX ── */
+function formulaBox(x, y, w, h, col, alpha, lines) {
+  /* glassmorphism panel */
+  ct.fillStyle   = rgba(P.surf2, alpha*.97);
+  ct.strokeStyle = rgba(col, alpha*.5);
+  ct.lineWidth   = .9;
+  rr(x,y,w,h,10); ct.fill(); ct.stroke();
+  /* accent bar */
+  ct.fillStyle = rgba(col, alpha*.85);
+  rr(x,y,3,h,2); ct.fill();
+  /* top glow */
+  const grd = ct.createLinearGradient(x,y,x,y+h);
+  grd.addColorStop(0, rgba(col, alpha*.08));
+  grd.addColorStop(1, rgba(col, 0));
+  ct.fillStyle = grd; rr(x,y,w,h,10); ct.fill();
+  lines.forEach((ln,i) => {
+    txt(ln.t, x+w/2, y+20+i*20, rgba(ln.c||col, alpha*(ln.a||1)), ln.s||11);
+  });
+}
+
+/* ── HEADER BAR ── */
+function header(s, p) {
+  const a = eOut(p*3), st = STEPS[s];
+  ct.fillStyle = rgba(st.col,.07);
+  rr(12,6,W-24,44,8); ct.fill();
+  ct.strokeStyle = rgba(st.col,.22); ct.lineWidth = .9;
+  rr(12,6,W-24,44,8); ct.stroke();
+  /* top accent gradient line */
+  const g = ct.createLinearGradient(12,0,W-12,0);
+  g.addColorStop(0,'transparent'); g.addColorStop(.5,rgba(st.col,.75)); g.addColorStop(1,'transparent');
+  ct.strokeStyle = g; ct.lineWidth = 1.5;
+  ct.beginPath(); ct.moveTo(12,6); ct.lineTo(W-12,6); ct.stroke();
+  /* emoji */
+  ct.font = '17px serif'; ct.textAlign = 'left'; ct.fillText(st.e, 24, 36);
+  /* title */
+  ct.font = `bold 12.5px 'Space Grotesk',sans-serif`;
+  ct.fillStyle = rgba(P.text, a); ct.textAlign = 'left'; ct.fillText(st.n, 48, 36);
+  /* right label */
+  ct.font = `10px 'JetBrains Mono',monospace`;
+  ct.fillStyle = rgba(st.col, a*.75); ct.textAlign = 'right';
+  ct.fillText('ANN · Multi-Layer Perceptron', W-18, 36);
+}
+
+/* ══════════════════════════════════════════════
+   STEP RENDERS  — each receives p in [0,1]
+   All Y positions go through CY() so they track
+   the live canvas height after resize.
+   ══════════════════════════════════════════════ */
+
+function rS0(p) {
+  const cs   = lerp(0, 9.5, eBounce(clamp(p*1.6,0,1)));
+  const fade = eOut(p*2.5);
+  const cx   = W/2, cy = CY();
+  if (cs > .5) drawDigit(cx, cy, cs, clamp(fade,0,1), 0);
+  if (p > .35) {
+    const ga = eOut((p-.35)/.65);
+    ct.strokeStyle = rgba(P.brd, ga*.45); ct.lineWidth = .3;
+    const gx = cx - 14*cs, gy = cy - 14*cs;
+    for (let i=0; i<=28; i++) {
+      ct.beginPath(); ct.moveTo(gx+i*cs, gy); ct.lineTo(gx+i*cs, gy+28*cs); ct.stroke();
+      ct.beginPath(); ct.moveTo(gx, gy+i*cs); ct.lineTo(gx+28*cs, gy+i*cs); ct.stroke();
+    }
+    if (ga > .55) {
+      const aa = (ga-.55)*2.2;
+      const r2=4, c2=10, pv = Math.round(PX[r2][c2]*255);
+      ct.strokeStyle = rgba(P.yellow, aa*.9); ct.lineWidth = 1.5;
+      rr(gx+c2*cs, gy+r2*cs, cs, cs, 1); ct.stroke();
+      const bx = Math.min(cx+14*cs+22, W-210);
+      formulaBox(bx, cy-26, 190, 50, P.yellow, aa, [
+        { t:`pixel[${r2}][${c2}] = ${pv}`, c:P.yellow, s:11 },
+        { t:'→ one input neuron',           c:P.muted,  s:10, a:.8 }
+      ]);
+    }
+  }
+  badge('28 × 28 = 784 input neurons', cx, cy+14*cs+28, P.blue,   12);
+  badge(trueLabel,                     cx, cy+14*cs+48, P.yellow, 12);
+}
+
+function rS1(p) {
+  const a    = eOut(p);
+  const zW   = W/3;
+  const lx   = zW*.5, mx = zW*1.5, rx = zW*2.5;
+  const cs   = 7.5, hpx = cs*14;
+  const cy   = CY();
+  drawDigit(lx, cy, cs, clamp(a,0,1), 0);
+  lbl('Raw  (0–255)',   lx, cy+hpx+14, P.muted, 10);
+  badge('uint8',        lx, cy+hpx+30, P.muted, 10);
+  if (p > .25) {
+    const fa  = eOut((p-.25)/.75);
+    const fbW = Math.min(198,zW-20), fbH = 50;
+    formulaBox(mx-fbW/2, cy-fbH/2, fbW, fbH, P.cyan, fa, [
+      { t:'pixel ÷ 255.0',           c:P.cyan,  s:15 },
+      { t:'→ range [ 0.0 … 1.0 ]',   c:P.muted, s:10, a:.8 }
+    ]);
+    const ax1 = lx+hpx+8, ax2 = mx-fbW/2-8;
+    if (ax2 > ax1+20) arrowSolid(ax1,cy,ax2,cy,P.cyan,fa,2.5);
+  }
+  if (p > .45) {
+    const wa = eOut((p-.45)/.55);
+    drawDigit(rx, cy, cs, clamp(a,0,1), wa);
+    lbl('Normalised  (0.0–1.0)',      rx, cy+hpx+14, P.cyan, 10);
+    badge('float32  (1, 784)',        rx, cy+hpx+30, P.cyan, 10);
+    arrowSolid(mx+98+8,cy,rx-hpx-8,cy,P.cyan,wa,2.5);
+  }
+  if (p > .72) {
+    const ca = eOut((p-.72)/.28);
+    formulaBox(12, cy+hpx+46, W-24, 36, P.cyan, ca, [
+      { t:'WHY normalise? Equal scale → no pixel dominates → manageable gradients → faster training', c:P.cyan, s:10 }
+    ]);
+  }
+}
+
+function rS2(p) {
+  const a  = eOut(p);
+  const ls = getLayers();
+  const cy = CY();
+  thumb(clamp(a,0,1));
+  drawLayer(ls,0,a*.45,0.4,false,0,p*3);
+  drawLayer(ls,2,a*.20,0.3,false,0,p*2);
+  drawLayer(ls,3,a*.15,0.2,false,0,p*2);
+  drawConnections(ls,0,1,a*.5,clamp(p*2,0,1),P.purple);
+  drawLayer(ls,1,clamp(a,0,1),0.7,false,0,p*4);
+  [0,1,2,3].forEach(i => layerLabel(ls,i,a*(i===1?1:.4)));
+  if (p > .42) {
+    const fa  = eOut((p-.42)/.58);
+    const bot = cy + ls[1].n/2*SP + 38;
+    formulaBox(12, bot, W-24, 58, P.purple, fa, [
+      { t:'Each neuron:  z = w₁x₁ + w₂x₂ + … + w₇₈₄x₇₈₄ + b',      c:P.purple, s:11 },
+      { t:'output = ReLU(z) = max(0,z)  →  kills negatives',           c:P.yellow, s:10, a:.9 },
+      { t:'784 × 128 = 100,352 weights  +  128 biases  =  100,480 params', c:P.muted, s:9, a:.8 }
+    ]);
+  }
+}
+
+function rS3(p) {
+  const a  = eOut(p);
+  const ls = getLayers();
+  const cy = CY();
+  thumb(clamp(a,0,1));
+  drawLayer(ls,0,a*.18,0.3,false,0,p*2);
+  drawLayer(ls,1,a*.45,0.5,false,0,p*3);
+  drawLayer(ls,3,a*.15,0.2,false,0,p*2);
+  drawConnections(ls,0,1,a*.25,0,null);
+  drawConnections(ls,1,2,a*.65,clamp(p*2,0,1),P.pink);
+  drawLayer(ls,2,clamp(a,0,1),0.7,false,0,p*4);
+  [0,1,2,3].forEach(i => layerLabel(ls,i,a*(i===2?1:.3)));
+  if (p > .4) {
+    const fa  = eOut((p-.4)/.6);
+    const bot = cy + ls[2].n/2*SP + 38;
+    formulaBox(12, bot, W-24, 58, P.pink, fa, [
+      { t:'Receives 128 inputs from Hidden Layer 1 — outputs 64 values', c:P.pink,   s:11 },
+      { t:'Deeper layers detect combinations of combinations',            c:P.yellow, s:10, a:.9 },
+      { t:'128 × 64 = 8,192 weights  +  64 biases  =  8,256 params',    c:P.muted,  s:9,  a:.8 }
+    ]);
+  }
+}
+
+function rS4(p) {
+  const a  = eOut(p);
+  const ls = getLayers();
+  const cy = CY();
+  const dp = clamp((p-.2)/.8, 0, 1);
+  thumb(clamp(a,0,1));
+  drawConnections(ls,0,1,a*.18,0,null);
+  drawConnections(ls,1,2,a*.25,0,null);
+  drawLayer(ls,0,a*.28,0.3,false,0,0);
+  drawLayer(ls,1,a*.45,0.5,true,dp,0);
+  drawLayer(ls,2,a*.35,0.4,true,dp*.8,0);
+  drawLayer(ls,3,a*.20,0.2,false,0,0);
+  [0,1,2,3].forEach(i => layerLabel(ls,i,a*.65));
+  if (dp > .1) {
+    const la = eOut((dp-.1)/.9);
+    ct.fillStyle   = rgba(P.red, la*.12);
+    ct.strokeStyle = rgba(P.red, la*.5);
+    ct.lineWidth   = .9;
+    rr(W/2-165,8,330,24,6); ct.fill(); ct.stroke();
+    txt('✕ = neuron disabled (50 % chance each step)', W/2, 24, rgba(P.red,la*.85), 10);
+  }
+  if (p > .48) {
+    const fa  = eOut((p-.48)/.52);
+    const bot = cy + ls[2].n/2*SP + 38;
+    formulaBox(12, bot, W-24, 58, P.orange, fa, [
+      { t:'Dropout(0.5): each neuron independently zeroed with 50 % prob',   c:P.orange, s:11 },
+      { t:'Effect: prevents co-adaptation — each neuron must be useful alone', c:P.yellow, s:10, a:.9 },
+      { t:'At test time: Dropout OFF — all neurons active — outputs × 0.5',  c:P.muted,  s:9,  a:.8 }
+    ]);
+  }
+}
+
+function rS5(p) {
+  const a  = eOut(p);
+  const ls = getLayers();
+  const cy = CY();
+  drawConnections(ls,0,1,a*.12,0,null);
+  drawConnections(ls,1,2,a*.12,0,null);
+  drawLayer(ls,0,a*.15,0.3,false,0,0);
+  drawLayer(ls,1,a*.15,0.3,false,0,0);
+  drawLayer(ls,2,a*.15,0.3,false,0,0);
+  drawConnections(ls,2,3,a*.65,clamp(p*2.2,0,1),P.green);
+
+  /* output neurons with digit labels */
+  for (let i=0; i<10; i++) {
+    const y      = cy + (i-4.5)*SP;
+    const active = (i === PRED);
+    if (active) {
+      glow(ls[3].x, y, 12, P.green, clamp(a,0,1));
+    } else {
+      ct.beginPath(); ct.arc(ls[3].x, y, 11, 0, Math.PI*2);
+      ct.fillStyle   = rgba(P.purple, a*.12); ct.fill();
+      ct.strokeStyle = rgba(P.purple, a*.38); ct.lineWidth = .9; ct.stroke();
+    }
+    ct.font = '9px \'JetBrains Mono\',monospace';
+    ct.fillStyle = rgba(active ? P.green : P.muted, a);
+    ct.textAlign = 'left'; ct.fillText(String(i), ls[3].x+16, y+3.5);
+  }
+  lbl('Output',     ls[3].x, cy+5*SP+20, rgba(P.green,a*.95), 10);
+  lbl('10,Softmax', ls[3].x, cy+5*SP+36, rgba(P.muted,a*.8),   9);
+  badge('→ Softmax →', ls[3].x+64, cy, P.green, 10);
+
+  /* ── BAR CHART ── positioned safely above the formula box */
+  if (p > .18) {
+    const ba  = eOut((p-.18)/.82);
+    /* chart sits between the thumb right-edge and the output layer left-edge */
+    const bx  = ls[0].x - 30;
+    const bw  = ls[2].x - ls[0].x + 60;
+    /* top of chart: fixed fraction of canvas height so it never overlaps header */
+    const by  = Math.round(H * 0.08);
+    const bh  = Math.round(H * 0.32);
+    const bw2 = bw / 10;
+
+    /* chart background */
+    ct.fillStyle = rgba(P.surf, ba*.55);
+    rr(bx-4, by-4, bw+8, bh+28, 8); ct.fill();
+    ct.strokeStyle = rgba(P.brd, ba*.5); ct.lineWidth = .7;
+    rr(bx-4, by-4, bw+8, bh+28, 8); ct.stroke();
+
+    badge('Softmax Confidence', bx+bw/2, by-16, P.green, 10);
+
+    for (let i=0; i<10; i++) {
+      const animH = PROBS[i]*bh * clamp((p-.18)/.55, 0, 1);
+      const x     = bx + i*bw2 + 1.5;
+      const col   = (i===PRED) ? P.green : (i===TRUE&&TRUE>=0 ? P.blue : P.muted);
+      ct.fillStyle = rgba(col, (i===PRED?.9:.25)*ba);
+      rr(x, by+bh-animH, bw2-3, animH, 2); ct.fill();
+      if (i===PRED && animH>4) {
+        ct.shadowColor = rgba(P.green,.5); ct.shadowBlur = 8;
+        ct.fillStyle   = rgba(P.green,.3);
+        rr(x, by+bh-animH, bw2-3, animH, 2); ct.fill();
+        ct.shadowBlur = 0;
+      }
+      ct.font = '9px \'JetBrains Mono\',monospace';
+      ct.fillStyle = rgba(col, ba); ct.textAlign = 'center';
+      ct.fillText(String(i), x+(bw2-3)/2, by+bh+14);
+      if (i===PRED) {
+        ct.fillStyle = rgba(P.green, ba);
+        ct.fillText(Math.round(PROBS[i]*100)+'%', x+(bw2-3)/2, by+bh-animH-8);
+      }
+    }
+    ct.strokeStyle = rgba(P.muted,.22); ct.lineWidth = .5;
+    ct.beginPath(); ct.moveTo(bx,by+bh); ct.lineTo(bx+bw,by+bh); ct.stroke();
+    badge('Prediction: '+PRED, bx+bw/2, by+bh+28, P.green, 11);
+  }
+
+  /* ── RESULT BOX (bottom-right, bounces in) ── */
+  if (p > .62) {
+    const va = eBounce(clamp((p-.62)/.38, 0, 1));
+    const vc = OK ? P.green : P.orange;
+    const bx = W-170, by = cy-70, bw = 158, bh = 140;
+    ct.shadowColor = rgba(vc,.4); ct.shadowBlur = 28;
+    ct.fillStyle = rgba(P.dark,.97); rr(bx,by,bw,bh,14); ct.fill();
+    ct.shadowBlur = 0;
+    ct.strokeStyle = rgba(vc, va*.9); ct.lineWidth = 2.5;
+    rr(bx,by,bw,bh,14); ct.stroke();
+    /* top gradient line */
+    const grd = ct.createLinearGradient(bx,by,bx+bw,by);
+    grd.addColorStop(0,'transparent'); grd.addColorStop(.5,rgba(vc,.7)); grd.addColorStop(1,'transparent');
+    ct.strokeStyle = grd; ct.lineWidth = 2;
+    ct.beginPath(); ct.moveTo(bx+14,by); ct.lineTo(bx+bw-14,by); ct.stroke();
+    /* big digit */
+    ct.font = `bold 54px 'Space Grotesk',sans-serif`;
+    ct.fillStyle = rgba(vc, va);
+    ct.shadowColor = rgba(vc,va*.5); ct.shadowBlur = 20;
+    ct.textAlign = 'center'; ct.fillText(String(PRED), bx+bw/2, by+68);
+    ct.shadowBlur = 0;
+    txt(OK?'✓ CORRECT':'✗ WRONG',   bx+bw/2, by+88,  rgba(vc,va*.9),  10);
+    txt(Math.round(PROBS[PRED]*100)+'% confidence', bx+bw/2, by+104, rgba(vc,va*.75), 9);
+    txt(trueLabel,                    bx+bw/2, by+120, rgba(P.muted,va*.65), 9);
+    /* confetti on correct */
+    if (OK && va>.5) for (let i=0; i<22; i++) {
+      const ang = (i/22)*Math.PI*2, d = 50+i*3;
+      const cx2 = bx+bw/2 + Math.cos(ang)*d*(va-.42)*2;
+      const cy2 = by+68   + Math.sin(ang)*d*(va-.42)*1.4;
+      ct.fillStyle = rgba([P.green,P.yellow,P.cyan,P.pink,P.purple,P.orange][i%6], clamp((va-.5)*2,0,1)*.8);
+      ct.beginPath(); ct.arc(cx2,cy2,3.5,0,Math.PI*2); ct.fill();
+    }
+  }
+}
+
+const RENDERS = [rS0, rS1, rS2, rS3, rS4, rS5];
+
+function render(s, p) {
+  ct.fillStyle = P.bg; ct.fillRect(0,0,W,H);
+  header(s, p);
+  ct.save(); ct.translate(0, 56); RENDERS[s](p); ct.restore();
+}
+
+/* ── ANIMATION LOOP ── */
+function loop(ts) {
+  if (!running) { raf = null; return; }
+  const dt = Math.min((ts - lastTs)/1000, .05) * speed;
+  lastTs = ts;
+  prog = Math.min(prog + dt/STEP_DUR, 1);
+  render(step, prog);
+  updateUI();
+  if (prog >= 1) {
+    if (playAll && step < 5) {
+      running = false;
+      setTimeout(() => { step++; prog=0; running=true; lastTs=performance.now(); raf=requestAnimationFrame(loop); updateBtns(); }, 800/speed);
+    } else {
+      running=false; playAll=false; updateBtns(); raf=null;
+    }
+  } else {
+    raf = requestAnimationFrame(loop);
+  }
+}
+function startAnim() {
+  if (raf) cancelAnimationFrame(raf);
+  running=true; lastTs=performance.now(); raf=requestAnimationFrame(loop);
+}
+
+/* ── UI SYNC ── */
+function updateUI() {
+  document.getElementById('sctr').textContent = (step+1)+'/6';
+  const s = STEPS[step];
+  document.getElementById('ie').textContent    = s.e;
+  document.getElementById('ititle').textContent = s.n;
+  document.getElementById('idesc').textContent  = s.d;
+  const cols=['#4f9eff','#22d3ee','#a78bfa','#f472b6','#fb923c','#34d399'];
+  for (let i=0; i<6; i++) {
+    const d = document.getElementById('sd'+i);
+    if (!d) continue;
+    d.className = 'sbtn2' + (i===step?' active':(i<step?' done':''));
+    d.style.setProperty('--sc', cols[i]);
+  }
+  /* progress bar */
+  const pct = ((step+prog)/6)*100;
+  const pb  = document.getElementById('_pgbar');
+  if (pb) { pb.style.width=pct+'%'; pb.style.background=STEPS[step].col; }
+}
+function updateBtns() {
+  document.getElementById('bprev').disabled = (step===0);
+  document.getElementById('bnext').disabled = (step===5 && prog>=1);
+  const pl = running && playAll;
+  document.getElementById('bplay').textContent = pl ? '⏸ Pause' : '▶ Play All';
+  document.getElementById('bplay').className   = 'cbtn' + (pl?'':' pri');
+}
+function jumpTo(i) {
+  if (raf) cancelAnimationFrame(raf);
+  step=i; prog=0; running=true; playAll=false; startAnim(); updateBtns();
+}
+
+/* ── BUTTON HANDLERS ── */
+document.getElementById('bplay').onclick = () => {
+  if (running && playAll) { running=false; playAll=false; updateBtns(); return; }
+  if (step===5 && prog>=1) { step=0; prog=0; }
+  playAll=true; startAnim(); updateBtns();
+};
+document.getElementById('bnext').onclick  = () => { step=Math.min(step+1,5); prog=0; playAll=false; startAnim(); updateBtns(); };
+document.getElementById('bprev').onclick  = () => { step=Math.max(step-1,0); prog=0; playAll=false; startAnim(); updateBtns(); };
+document.getElementById('breset').onclick = () => { if(raf)cancelAnimationFrame(raf); running=false; playAll=false; step=0; prog=0; render(0,0); updateUI(); updateBtns(); };
+document.getElementById('spd').oninput    = function() { speed=parseFloat(this.value); document.getElementById('sl').textContent=speed+'×'; };
+</script>"""
+
+    # ── extra CSS patches injected into the shell so step-pills use --sc variable ──
+    extra_css = """
+<style>
+#_pgbar{height:3px;background:var(--blue);border-radius:2px;transition:width .12s,background .3s}
+.sbtn2.active{border-color:var(--sc,#4f9eff)!important;color:var(--sc,#4f9eff)!important;
+  background:color-mix(in srgb,var(--sc,#4f9eff) 12%,transparent)!important;
+  box-shadow:0 0 10px color-mix(in srgb,var(--sc,#4f9eff) 30%,transparent)!important}
+</style>
+<div id="_pgbar" style="width:0%;margin-bottom:6px"></div>
+"""
+
+    shell = anim_shell(
+        "🟡 ANN — Multi-Layer Perceptron",
+        [("Input 784","#4f9eff"),("Hidden 1  128","#a78bfa"),
+         ("Hidden 2  64","#f472b6"),("Dropout","#fb923c"),
+         ("Output  10","#34d399")],
+        6
+    )
+    return shell.replace("</body></html>", extra_css + data + js + "</body></html>")
+# ═══════════════════════════════════════════════════════════════════
+# CNN ANIMATION
+# ═══════════════════════════════════════════════════════════════════
+def build_cnn_anim(px28, true_label, pred_label, probs, c1t, c2t):
+    data = (
+        "<script>\n"
+        f"const PX={json.dumps(px28.tolist())};\n"
+        f"const PROBS={json.dumps([round(float(p),4) for p in probs])};\n"
+        f"const C1={json.dumps(c1t)};\n"
+        f"const C2={json.dumps(c2t)};\n"
+        f"const PRED={int(pred_label)};\n"
+        f"const TRUE={int(true_label) if true_label is not None else -1};\n"
+        f"const OK={'true' if true_label is not None and pred_label==true_label else 'false'};\n"
+        "</script>\n"
+    )
+    js = r"""
+<script>
+const cv=document.getElementById('cvs'),ct=cv.getContext('2d');
+let W,H;
+function resizeCanvas(){
+  W=Math.min(cv.parentElement.clientWidth-28, 1100);
+  H=Math.round(W*0.51);
+  cv.width=W; cv.height=H;
+  cv.style.height=H+'px';
+  const total=H+280;
+  document.body.style.minHeight=total+'px';
+  try{window.parent.postMessage({type:'streamlit:setFrameHeight',height:total},'*')}catch(e){}
+}
+window.addEventListener('load',()=>{resizeCanvas();});
+window.addEventListener('resize',()=>{resizeCanvas();if(typeof render==='function')render(step,prog);});
+resizeCanvas();
+const P={bg:'#0b0f1a',surf:'#111827',surf2:'#1a2236',brd:'#1f2d45',blue:'#4f9eff',cyan:'#22d3ee',green:'#34d399',yellow:'#fbbf24',orange:'#fb923c',pink:'#f472b6',purple:'#a78bfa',red:'#f87171',text:'#e2e8f0',muted:'#64748b',dark:'#080d16'};
+const STEP_DUR=3.5;
+let step=0,running=true,playAll=true,prog=0,lastTs=0,speed=1,raf=null;
+const trueLabel=TRUE>=0?('True:'+TRUE):'(drawn)';
+const STEPS=[
+  {e:'🖼️',n:'Step 1 — Raw Input  (28×28 image)',col:P.blue,d:'The CNN receives the full 28×28 greyscale image as a 2D grid — NOT flattened. Spatial relationships between pixels are preserved. This is the key advantage over Perceptron and plain ANN.'},
+  {e:'⚖️',n:'Step 2 — Normalise  (÷ 255)',col:P.cyan,d:'Pixel values (0–255) → floats (0.0–1.0). The image is reshaped to (1, 28, 28, 1) — batch of 1, height 28, width 28, 1 colour channel. This is the exact input tensor shape the CNN expects.'},
+  {e:'🔍',n:'Step 3 — Conv2D Layer 1  (32 filters, 3×3, ReLU)',col:P.purple,d:'32 learnable 3×3 filters slide across the image using a dot product at each position. Each filter detects ONE pattern: edges, strokes, corners. ReLU zeros negatives → output shape: 26×26×32.'},
+  {e:'📉',n:'Step 4 — MaxPooling2D  (2×2)',col:P.orange,d:'A 2×2 window keeps the MAXIMUM activation in each region. Halves spatial dimensions: 26×26 → 13×13. Discards 75% of data but keeps the strongest signals. Makes model translation-invariant.'},
+  {e:'🔬',n:'Step 5 — Conv2D Layer 2  (64 filters, 3×3, ReLU)',col:P.pink,d:'64 deeper filters now examine the pooled feature maps. They combine lower-level features (edges) into higher-level patterns: curves, loops, T-junctions. Output: 11×11×64.'},
+  {e:'🧠',n:'Step 6 — Flatten → Dense(128) → Dropout',col:P.yellow,d:'5×5×64 = 1,600 values are unrolled into a vector. Dense(128) learns which feature combinations predict each digit. Dropout(50%) prevents co-adaptation → more robust generalisation.'},
+  {e:'🎯',n:'Step 7 — Dense(10) → Softmax → Prediction',col:P.green,d:'10 output neurons — one per digit. Softmax turns raw scores into probabilities summing to 1.0. The argmax gives the CNN\'s final prediction. CNN typically outperforms ANN/Perceptron on images.'}
+];
+function lerp(a,b,t){return a+(b-a)*t}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+function eO(t){return 1-Math.pow(1-clamp(t,0,1),3)}
+function eE(t){t=clamp(t,0,1);if(!t||t===1)return t;return Math.pow(2,-10*t)*Math.sin((t*10-.75)*(2*Math.PI/3))+1}
+function rgba(h,a){return `rgba(${parseInt(h.slice(1,3),16)},${parseInt(h.slice(3,5),16)},${parseInt(h.slice(5,7),16)},${a})`}
+function rr(x,y,w,h,r){ct.beginPath();ct.moveTo(x+r,y);ct.lineTo(x+w-r,y);ct.arcTo(x+w,y,x+w,y+r,r);ct.lineTo(x+w,y+h-r);ct.arcTo(x+w,y+h,x+w-r,y+h,r);ct.lineTo(x+r,y+h);ct.arcTo(x,y+h,x,y+h-r,r);ct.lineTo(x,y+r);ct.arcTo(x,y,x+r,y,r);ct.closePath()}
+function txt(s,x,y,col,sz,align,font){sz=sz||11;align=align||'center';font=font||"'JetBrains Mono',monospace";ct.font=`${sz}px ${font}`;ct.fillStyle=col;ct.textAlign=align;ct.fillText(s,x,y)}
+function badge(s,x,y,col,sz){sz=sz||11;ct.font=`${sz}px 'JetBrains Mono',monospace`;const tw=ct.measureText(s).width,bw=tw+16,bh=sz+10;ct.fillStyle=rgba(col,.18);ct.strokeStyle=rgba(col,.55);ct.lineWidth=1;rr(x-bw/2,y-bh/2,bw,bh,bh/2);ct.fill();ct.stroke();ct.fillStyle=col;ct.textAlign='center';ct.fillText(s,x,y+sz/3)}
+function lbl(s,x,y,col,sz){sz=sz||10;ct.font=`${sz}px 'JetBrains Mono',monospace`;const tw=ct.measureText(s).width;ct.fillStyle=rgba(P.dark,.78);rr(x-tw/2-4,y-sz-1,tw+8,sz+5,3);ct.fill();ct.fillStyle=col;ct.textAlign='center';ct.fillText(s,x,y)}
+function arrow(x1,y1,x2,y2,col,a,thick){thick=thick||1.5;ct.strokeStyle=rgba(col,a*.8);ct.lineWidth=thick;ct.setLineDash([5,4]);ct.beginPath();ct.moveTo(x1,y1);ct.lineTo(x2,y2);ct.stroke();ct.setLineDash([]);const ang=Math.atan2(y2-y1,x2-x1);ct.fillStyle=rgba(col,a);ct.beginPath();ct.moveTo(x2,y2);ct.lineTo(x2-10*Math.cos(ang-.35),y2-10*Math.sin(ang-.35));ct.lineTo(x2-10*Math.cos(ang+.35),y2-10*Math.sin(ang+.35));ct.closePath();ct.fill()}
+function neuron(x,y,r,col,alpha){ct.beginPath();ct.arc(x,y,r,0,Math.PI*2);ct.fillStyle=rgba(col,alpha*.28);ct.fill();ct.strokeStyle=rgba(col,alpha*.85);ct.lineWidth=1;ct.stroke()}
+function drawDigit(cx,cy,cs,alpha,warmth){warmth=warmth||0;for(let r=0;r<28;r++)for(let c=0;c<28;c++){const v=PX[r][c],px=cx+(c-14)*cs+cs*.5,py=cy+(r-14)*cs+cs*.5;if(v>.04){const vi=Math.min(v*1.25,1);ct.fillStyle=warmth>0?`rgba(${Math.round(lerp(79,251,vi*warmth))},${Math.round(lerp(158,191,vi*warmth))},${Math.round(lerp(255,36,vi*warmth))},${alpha})`:`rgba(${Math.round(lerp(15,79,vi))},${Math.round(lerp(30,158,vi))},${Math.round(lerp(50,255,vi))},${alpha})`}else ct.fillStyle=`rgba(15,20,35,${alpha})`;ct.fillRect(px,py,cs-.5,cs-.5)}}
+function thumb(alpha){const ts=3.6,tx=56,ty=H/2+6;ct.fillStyle=rgba(P.surf2,.95);rr(tx-ts*14-5,ty-ts*14-5,ts*28+10,ts*28+10,6);ct.fill();ct.strokeStyle=rgba(P.brd,.7);ct.lineWidth=.8;rr(tx-ts*14-5,ty-ts*14-5,ts*28+10,ts*28+10,6);ct.stroke();drawDigit(tx,ty,ts,alpha,0);lbl('Your digit',tx,ty+ts*14+14,P.muted,9);badge(trueLabel,tx,ty+ts*14+30,P.yellow,10)}
+function drawMaps(maps,ox,oy,tsz,gap,cols,alpha,cF){maps.forEach((fm,i)=>{const col=i%cols,row=Math.floor(i/cols),x=ox+col*(tsz+gap),y=oy+row*(tsz+gap);ct.fillStyle=rgba(P.surf2,alpha);rr(x,y,tsz,tsz,3);ct.fill();const fh=fm.length,fw=fm[0].length,pw=tsz/fw,ph=tsz/fh;for(let r=0;r<fh;r++)for(let c=0;c<fw;c++){const v=Math.min(Math.max(fm[r][c],0),1),rgb=cF(v);ct.fillStyle=`rgba(${rgb[0]},${rgb[1]},${rgb[2]},${v*alpha*.95})`;ct.fillRect(x+c*pw,y+r*ph,pw,ph)}ct.strokeStyle=rgba(P.brd,alpha*.4);ct.lineWidth=.5;rr(x,y,tsz,tsz,3);ct.stroke();lbl('F'+(i+1),x+tsz/2,y+tsz+11,P.muted,8)})}
+function topBar(p,col){ct.fillStyle=rgba(P.brd,.6);rr(14,6,W-28,5,2);ct.fill();if(p>0){ct.fillStyle=col;rr(14,6,(W-28)*clamp(p,0,1),5,2);ct.fill()}}
+function header(s,p){const a=eO(p*3),st=STEPS[s];ct.fillStyle=rgba(st.col,.08);rr(14,18,W-28,48,8);ct.fill();ct.strokeStyle=rgba(st.col,.2);ct.lineWidth=.8;rr(14,18,W-28,48,8);ct.stroke();badge(st.e,55,40,st.col,11);ct.font="bold 13px 'Space Grotesk',sans-serif";ct.fillStyle=rgba(P.text,a);ct.textAlign='left';ct.fillText(st.n,88,44);ct.font="10px 'JetBrains Mono',monospace";ct.fillStyle=rgba(st.col,a*.85);ct.textAlign='right';ct.fillText('CNN — Convolutional Neural Network',W-22,44)}
+function rS0(p){const cs=lerp(0,11,eO(p*1.5)),fade=eO(p*2.5);if(cs>.5)drawDigit(W/2,H/2,cs,clamp(fade,0,1),0);if(p>.4){const ga=eO((p-.4)/.6);ct.strokeStyle=rgba(P.brd,ga*.55);ct.lineWidth=.35;const gx=W/2-14*cs,gy=H/2-14*cs;for(let i=0;i<=28;i++){ct.beginPath();ct.moveTo(gx+i*cs,gy);ct.lineTo(gx+i*cs,gy+28*cs);ct.stroke();ct.beginPath();ct.moveTo(gx,gy+i*cs);ct.lineTo(gx+28*cs,gy+i*cs);ct.stroke()}}badge('28×28×1  (spatial grid preserved)',W/2,H/2+14*cs+30,P.blue,12);badge(trueLabel,W/2,H/2+14*cs+50,P.yellow,12)}
+function rS1(p){
+  const a=eO(p);
+  const zoneW=W/3;
+  const leftX=zoneW*0.5;
+  const midX=zoneW*1.5;
+  const rightX=zoneW*2.5;
+  const cs=7.5, halfPx=cs*14;
+
+  drawDigit(leftX,H/2,cs,clamp(a,0,1),0);
+  lbl('Raw  0–255',leftX,H/2+halfPx+14,P.muted,10);
+
+  if(p>.28){
+    const fa=eO((p-.28)/.72);
+    const fbW=Math.min(180,zoneW-20), fbH=52;
+    ct.fillStyle=rgba(P.surf2,fa*.95);
+    ct.strokeStyle=rgba(P.cyan,fa*.6);
+    ct.lineWidth=1;
+    rr(midX-fbW/2,H/2-fbH/2,fbW,fbH,10);
+    ct.fill(); ct.stroke();
+    ct.font="bold 16px 'JetBrains Mono',monospace";
+    ct.fillStyle=rgba(P.cyan,fa);
+    ct.textAlign='center';
+    ct.fillText('÷ 255.0',midX,H/2+2);
+    txt('→ shape: (1, 28, 28, 1)',midX,H/2+20,rgba(P.muted,fa*.8),10);
+    const arrowX1=leftX+halfPx+10, arrowX2=midX-fbW/2-8;
+    if(arrowX2>arrowX1+20) arrow(arrowX1,H/2,arrowX2,H/2,P.cyan,fa,2);
+  }
+
+  if(p>.45){
+    const wa=eO((p-.45)/.55);
+    drawDigit(rightX,H/2,cs,clamp(a,0,1),wa);
+    lbl('Normalised  0.0–1.0',rightX,H/2+halfPx+14,P.cyan,10);
+  }
+}
+function rS2(p){const a=eO(p);thumb(clamp(a,0,1));const ts=3.6,tx=56,ty=H/2+6,fp=Math.floor(p*25);const fx=fp%5,fy=Math.min(Math.floor(fp/5),4),ox=tx-ts*14,oy=ty-ts*14;ct.strokeStyle=rgba(P.purple,.92*clamp(a,0,1));ct.lineWidth=2;rr(ox+fx*ts*5.2,oy+fy*ts*5.2,ts*3,ts*3,3);ct.stroke();ct.fillStyle=rgba(P.purple,.13*clamp(a,0,1));ct.fill();arrow(118,H/2+6,152,H/2+6,P.purple,clamp(a,0,1),2.5);if(p>.22){const ma=eO((p-.22)/.78);drawMaps(C1,160,H/2-72,20,4,8,ma,v=>[Math.round(lerp(15,167,v)),Math.round(lerp(30,139,v)),Math.round(lerp(50,250,v))]);lbl('32 real conv1 maps',318,H/2+88,P.purple,9);badge('26×26×32',318,H/2+104,P.purple,10)}if(p>.55){const fa=eO((p-.55)/.45);ct.fillStyle=rgba(P.dark,fa*.95);rr(640,H/2-52,142,134,10);ct.fill();ct.strokeStyle=rgba(P.purple,fa*.5);ct.lineWidth=.9;rr(640,H/2-52,142,134,10);ct.stroke();for(let ri=0;ri<3;ri++)for(let ci=0;ci<3;ci++){const v=Math.sin((ri*3+ci)*2.1)*.5+.5;ct.fillStyle=rgba(v>.5?P.purple:P.pink,v*fa*.8);rr(648+ci*42,H/2-44+ri*42,36,36,5);ct.fill();ct.strokeStyle=rgba(P.brd,.4);ct.lineWidth=.4;rr(648+ci*42,H/2-44+ri*42,36,36,5);ct.stroke();txt(v.toFixed(2),648+ci*42+18,H/2-44+ri*42+22,rgba(P.text,fa*.9),10)}lbl('One 3×3 filter',711,H/2+86,P.purple,9);badge('ReLU: max(0,x)',711,H/2+102,P.orange,10)}}
+function rS3(p){const a=eO(p);thumb(clamp(a,0,1));drawMaps(C1,160,H/2-42,11,2,8,clamp(a,0,1),v=>[Math.round(lerp(15,167,v)),Math.round(lerp(30,139,v)),Math.round(lerp(50,250,v))]);badge('26×26×32',244,H/2+56,P.muted,10);arrow(280,H/2+6,314,H/2+6,P.orange,clamp(a,0,1),2.5);if(p>.2){const pa=eO((p-.2)/.8),bx=322,by=H/2-56;ct.fillStyle=rgba(P.dark,pa*.96);rr(bx,by,104,104,8);ct.fill();ct.strokeStyle=rgba(P.orange,pa*.55);ct.lineWidth=1;rr(bx,by,104,104,8);ct.stroke();lbl('2×2 window',bx+52,by-9,P.orange,9);const vals=[[142,211],[87,198]];for(let ri=0;ri<2;ri++)for(let ci=0;ci<2;ci++){ct.fillStyle=rgba(P.orange,vals[ri][ci]/255*pa*.8);rr(bx+5+ci*48,by+5+ri*48,42,42,4);ct.fill();txt(vals[ri][ci],bx+5+ci*48+21,by+5+ri*48+24,rgba(P.text,pa),12)}ct.strokeStyle=rgba(P.green,pa*.95);ct.lineWidth=2.5;rr(bx+5+48,by+5,42,42,4);ct.stroke();lbl('max=211 ✓',bx+52,by+108,P.green,10)}arrow(434,H/2+6,468,H/2+6,P.orange,clamp(a,0,1),2.5);if(p>.38){const ma=eO((p-.38)/.62);drawMaps(C1,476,H/2-42,11,2,8,ma,v=>[Math.round(lerp(15,167,v)),Math.round(lerp(30,139,v)),Math.round(lerp(50,250,v))]);badge('13×13×32',556,H/2+56,P.orange,10)}}
+function rS4(p){const a=eO(p);thumb(clamp(a,0,1));drawMaps(C1,160,H/2-42,11,2,8,clamp(a,0,1),v=>[Math.round(lerp(15,167,v)),Math.round(lerp(30,139,v)),Math.round(lerp(50,250,v))]);badge('13×13×32',240,H/2+56,P.muted,10);arrow(276,H/2+6,310,H/2+6,P.pink,clamp(a,0,1),2.5);if(p>.2){const ma=eO((p-.2)/.8);drawMaps(C2,318,H/2-76,16,3,8,ma,v=>[Math.round(lerp(20,244,v)),Math.round(lerp(20,114,v)),Math.round(lerp(20,182,v))]);lbl('64 real conv2 maps',508,H/2+86,P.pink,9);badge('11×11×64',508,H/2+102,P.pink,10)}}
+function rS5(p){const a=eO(p);thumb(clamp(a,0,1));const compress=Math.min(p*1.6,1),mw=Math.max(Math.round(lerp(11,2,compress)),2);drawMaps(C2,160,H/2-58,mw+1,2,8,clamp(a,0,1),v=>[Math.round(lerp(20,244,v)),Math.round(lerp(20,114,v)),Math.round(lerp(20,182,v))]);arrow(286,H/2+6,320,H/2+6,P.yellow,clamp(a,0,1),2.5);badge('Flatten  1600',354,H/2+4,P.muted,10);if(p>.3){const na=eO((p-.3)/.7);for(let ri=0;ri<7;ri++)for(let ci=0;ci<15;ci++){const v=Math.sin((ri*15+ci)*.48+p*5)*.5+.5,active=v>.6;neuron(412+ci*17,H/2+(ri-3.5)*18,6.5,active?P.yellow:P.brd,na)}badge('Dense(128)',666,H/2+4,P.yellow,10)}if(p>.6){const da=eO((p-.6)/.4);txt('Dropout 50%',666,H/2+22,rgba(P.red,da),9)}}
+function rS6(p){const a=eO(p);thumb(clamp(a,0,1));for(let i=0;i<10;i++){const y=H/2+(i-4.5)*22,active=i===PRED;neuron(182,y,9,active?P.green:P.purple,(active?1:.5)*clamp(a,0,1))}badge('Dense(10)',182,H/2+128,P.purple,10);arrow(202,H/2+6,244,H/2+6,P.green,clamp(a,0,1),2.5);badge('Softmax',276,H/2+4,P.green,11);if(p>.2){const ba=eO((p-.2)/.8),bx=308,by=H/2-106,bw=296,bh=160,bw2=bw/10;for(let i=0;i<10;i++){const bh2=PROBS[i]*bh,x=bx+i*bw2+2,col=i===PRED?P.green:(i===TRUE&&TRUE>=0?P.blue:P.muted);ct.fillStyle=rgba(col,(i===PRED?.9:.3)*ba);rr(x,by+bh-bh2,bw2-4,bh2,3);ct.fill();ct.font="9px 'JetBrains Mono',monospace";ct.fillStyle=rgba(col,ba);ct.textAlign='center';ct.fillText(String(i),x+(bw2-4)/2,by+bh+13);if(i===PRED){ct.fillStyle=rgba(P.green,ba);ct.fillText(Math.round(PROBS[i]*100)+'%',x+(bw2-4)/2,by+bh-bh2-7)}}ct.strokeStyle=rgba(P.muted,.3);ct.lineWidth=.5;ct.beginPath();ct.moveTo(bx,by+bh);ct.lineTo(bx+bw,by+bh);ct.stroke();badge('Prediction: '+PRED,bx+bw/2,by+bh+28,P.green,11)}if(p>.65){const va=eE(clamp((p-.65)/.35,0,1)),vc=OK?P.green:P.orange;ct.shadowColor=rgba(vc,.4);ct.shadowBlur=18;ct.fillStyle=rgba(P.dark,.95);rr(618,H/2-62,148,132,12);ct.fill();ct.shadowBlur=0;ct.strokeStyle=rgba(vc,va*.9);ct.lineWidth=2.5;rr(618,H/2-62,148,132,12);ct.stroke();ct.font="bold 52px 'JetBrains Mono',monospace";ct.fillStyle=rgba(vc,va);ct.textAlign='center';ct.fillText(String(PRED),692,H/2+12);txt(OK?'✓ CORRECT':'✗ WRONG',692,H/2+38,rgba(vc,va*.9),10);txt(Math.round(PROBS[PRED]*100)+'% conf',692,H/2+54,rgba(vc,va*.8),9);if(OK)for(let i=0;i<16;i++){const ang=(i/16)*Math.PI*2,d=50+i*2.6,cx2=692+Math.cos(ang)*d*(va-.4)*1.8,cy2=H/2-2+Math.sin(ang)*d*(va-.4)*1.2;ct.fillStyle=rgba([P.green,P.yellow,P.cyan,P.pink,P.purple][i%5],Math.min((va-.5)*2,1)*.8);ct.beginPath();ct.arc(cx2,cy2,3.2,0,Math.PI*2);ct.fill()}}}
+const RENDERS=[rS0,rS1,rS2,rS3,rS4,rS5,rS6];
+function render(s,p){ct.fillStyle=P.bg;ct.fillRect(0,0,W,H);topBar(p,STEPS[s].col);header(s,p);ct.save();ct.translate(0,74);RENDERS[s](p);ct.restore()}
+function loop(ts){if(!running){raf=null;return}const dt=Math.min((ts-lastTs)/1000,.05)*speed;lastTs=ts;prog=Math.min(prog+dt/STEP_DUR,1);render(step,prog);updateUI();if(prog>=1){if(playAll&&step<6){running=false;setTimeout(()=>{step++;prog=0;running=true;lastTs=performance.now();raf=requestAnimationFrame(loop);updateBtns()},700/speed)}else{running=false;playAll=false;updateBtns();raf=null}}else raf=requestAnimationFrame(loop)}
+function startAnim(){if(raf)cancelAnimationFrame(raf);running=true;lastTs=performance.now();raf=requestAnimationFrame(loop)}
+function updateUI(){document.getElementById('sctr').textContent=(step+1)+'/7';const s=STEPS[step];document.getElementById('ie').textContent=s.e;document.getElementById('ititle').textContent=s.n;document.getElementById('idesc').textContent=s.d;for(let i=0;i<7;i++){const d=document.getElementById('sd'+i);if(d)d.className='sbtn2'+(i===step?' active':(i<step?' done':''))}}
+function updateBtns(){document.getElementById('bprev').disabled=step===0;document.getElementById('bnext').disabled=step===6&&prog>=1;const pl=running&&playAll;document.getElementById('bplay').textContent=pl?'⏸ Pause':'▶ Play All';document.getElementById('bplay').className='cbtn'+(pl?'':' pri')}
+function jumpTo(i){if(raf)cancelAnimationFrame(raf);step=i;prog=0;running=true;playAll=false;startAnim();updateBtns()}
+document.getElementById('bplay').onclick=()=>{if(running&&playAll){running=false;playAll=false;updateBtns();return}if(step===6&&prog>=1){step=0;prog=0}playAll=true;startAnim();updateBtns()};
+document.getElementById('bnext').onclick=()=>{step=Math.min(step+1,6);prog=0;playAll=false;startAnim();updateBtns()};
+document.getElementById('bprev').onclick=()=>{step=Math.max(step-1,0);prog=0;playAll=false;startAnim();updateBtns()};
+document.getElementById('breset').onclick=()=>{if(raf)cancelAnimationFrame(raf);running=false;playAll=false;step=0;prog=0;render(0,0);updateUI();updateBtns()};
+document.getElementById('spd').oninput=function(){speed=parseFloat(this.value);document.getElementById('sl').textContent=speed+'×'};
+startAnim();updateUI();updateBtns();
+</script>"""
+    shell = anim_shell("🟢 CNN — Convolutional Neural Network",
+                       [("Input","#4f9eff"),("Conv filters","#a78bfa"),("Activations","#f472b6"),
+                        ("Pooling","#fb923c"),("Dense","#fbbf24"),("Output","#34d399")], 7)
+    return shell.replace("</body></html>", data + js + "</body></html>")
+
+
+# ─────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🧠 DL Visual Study")
+    st.markdown("---")
+    for key, path in PATHS.items():
+        exists = os.path.exists(path)
+        icon   = "✅" if exists else "❌"
+        color  = "#34d399" if exists else "#f87171"
+        st.markdown(
+            f"<div style='font-family:monospace;font-size:.8rem;margin:.3rem 0;'>"
+            f"{icon} <span style='color:{color};'>{path}</span></div>",
+            unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("### ⚙️ Settings")
+    n_filters = st.slider("CNN activation maps", 8, 32, 16, 8)
+    show_conf = st.checkbox("Show confidence chart", value=True)
+    st.markdown("---")
+    st.markdown("""
+<div style='font-size:.8rem;color:#64748b;line-height:2.2;'>
+<b style='color:#4f9eff;'>How to use Draw mode</b><br>
+① Draw digit on the 28×28 canvas<br>
+② Click <b>🔍 Predict</b> inside canvas<br>
+③ Click the blue <b>🔍 Predict All Models</b> button below canvas<br>
+④ Results appear instantly below
+</div>""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+# HERO
+# ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class='hero'>
+  <div class='hero-title'>🧠 Deep Learning Visual Study Tool</div>
+  <div class='hero-sub'>
+    Draw your own digit on the 28×28 grid — or pick a random test sample — 
+    and watch Perceptron, ANN, and CNN each process it step by step.
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class='model-grid'>
+  <div class='model-card' style='border-top-color:#4f9eff;'>
+    <div class='mc-name' style='color:#4f9eff;'>🔵 Perceptron</div>
+    <div class='mc-desc'>The simplest neural network. A single layer of neurons connected directly from input to output. Each pixel is a separate input — no spatial awareness.</div>
+    <div class='mc-tag' style='background:rgba(79,158,255,.15);color:#4f9eff;'>Linear classifier</div>
+  </div>
+  <div class='model-card' style='border-top-color:#fbbf24;'>
+    <div class='mc-name' style='color:#fbbf24;'>🟡 ANN  (MLP)</div>
+    <div class='mc-desc'>Multi-Layer Perceptron with hidden layers. Learns non-linear decision boundaries. Stronger than Perceptron, but still treats image as flat vector.</div>
+    <div class='mc-tag' style='background:rgba(251,191,36,.15);color:#fbbf24;'>Non-linear classifier</div>
+  </div>
+  <div class='model-card' style='border-top-color:#34d399;'>
+    <div class='mc-name' style='color:#34d399;'>🟢 CNN</div>
+    <div class='mc-desc'>Convolutional Neural Network — designed for images. Uses spatial filters to detect local patterns. Achieves the highest accuracy by respecting image structure.</div>
+    <div class='mc-tag' style='background:rgba(52,211,153,.15);color:#34d399;'>Spatial feature extractor</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("---")
+
+
+# ─────────────────────────────────────────────────────────────────
+# LOAD DATA + MODELS
+# ─────────────────────────────────────────────────────────────────
+with st.status("⏳ Loading MNIST…", expanded=False) as sd:
+    X_tr_flat, X_tr_4d, y_train, X_te_flat, X_te_4d, y_test = load_data()
+    sd.update(label=f"✅ MNIST ready — {len(X_tr_flat):,} train / {len(X_te_flat):,} test", state="complete")
+
+with st.status("📦 Loading models…", expanded=False) as sm:
+    models = load_all_models()
+    loaded  = [k for k,v in models.items() if v is not None]
+    missing = [k for k,v in models.items() if v is None]
+    sm.update(label=f"✅ Loaded: {', '.join(loaded)}"
+              + (f"  |  ❌ Missing: {', '.join(missing)}" if missing else ""),
+              state="complete")
+
+st.markdown("")
+
+
+# ─────────────────────────────────────────────────────────────────
+# SESSION STATE INIT
+# ─────────────────────────────────────────────────────────────────
+for prefix in ("p_", "a_", "c_"):
+    for k in ("idx","probs","pred","acts","c1t","c2t"):
+        key = prefix + k
+        if key not in st.session_state:
+            st.session_state[key] = None
+
+if "input_mode" not in st.session_state:
+    st.session_state["input_mode"] = "draw"
+
+
+# ─────────────────────────────────────────────────────────────────
+# INPUT SECTION
+# ─────────────────────────────────────────────────────────────────
+st.markdown("## ✏️ Input Your Digit")
+
+mode_col1, mode_col2 = st.columns(2)
+with mode_col1:
+    if st.button("✏️ Draw a Digit", use_container_width=True):
+        st.session_state["input_mode"] = "draw"
+with mode_col2:
+    if st.button("🎲 Random Test Sample", use_container_width=True):
+        st.session_state["input_mode"] = "random"
+
+mode = st.session_state["input_mode"]
+
+# ── DRAW MODE ──────────────────────────────────────────────────────
+if mode == "draw":
+    st.markdown("""<div class='callout cb' style='margin-bottom:.8rem;'>
+    <b>How to use:</b> ① Draw a digit on the canvas &nbsp;→&nbsp;
+    ② Click <b>🔍 Predict</b> inside the canvas &nbsp;→&nbsp;
+    ③ Click the blue <b>🔍 Predict All Models</b> button that appears below the canvas
+    </div>""", unsafe_allow_html=True)
+
+    drawn = render_draw_pad()
+
+    if drawn is not None and drawn.shape == (28, 28):
+        px_norm    = drawn.astype("float32")
+        true_label = None
+
+        draw_results = {}
+        for key in ["perceptron", "ann", "cnn"]:
+            m = models[key]
+            if m is None:
+                continue
+            probs, pred, img4d = predict_on_array(m, px_norm, key)
+            draw_results[key] = (probs, pred)
+            pfx = {"perceptron":"p_","ann":"a_","cnn":"c_"}[key]
+            st.session_state[f"{pfx}idx"]   = "drawn"
+            st.session_state[f"{pfx}probs"] = probs
+            st.session_state[f"{pfx}pred"]  = pred
+            if key == "cnn":
+                acts = get_activation_maps(m, img4d)
+                st.session_state[f"{pfx}acts"] = acts
+                st.session_state[f"{pfx}c1t"]  = activation_thumbnails(acts["conv1"], 16, 8) if acts else None
+                st.session_state[f"{pfx}c2t"]  = activation_thumbnails(acts["conv2"], 16, 8) if acts else None
+
+        if draw_results:
+            st.markdown("---")
+            st.markdown("### 🤖 All Models — Comparison")
+            cols = st.columns(len(draw_results) + 1)
+            with cols[0]:
+                fig = fig_digit(px_norm, title_override="Your Drawing")
+                st.pyplot(fig); plt.close(fig)
+            for ci, (key, (probs, pred)) in enumerate(draw_results.items(), 1):
+                colors = {"perceptron":"#4f9eff","ann":"#fbbf24","cnn":"#34d399"}
+                vc = colors[key]
+                conf = float(probs[pred]) * 100
+                with cols[ci]:
+                    st.markdown(f"""
+                    <div class='rcard' style='border-color:{vc};'>
+                      <div style='font-size:.75rem;color:{vc};font-family:monospace;font-weight:700;
+                        letter-spacing:.08em;text-transform:uppercase;margin-bottom:.4rem;'>
+                        {key.upper()}
+                      </div>
+                      <div class='rdigit' style='color:{vc};'>{pred}</div>
+                      <div class='rconf' style='color:{vc};'>{conf:.1f}%</div>
+                    </div>""", unsafe_allow_html=True)
+
+            if show_conf:
+                fig = fig_all_models_conf(draw_results)
+                if fig:
+                    st.pyplot(fig); plt.close(fig)
+
+            st.markdown("""<div class='callout cy'>
+            👆 Click a model tab below to see the full step-by-step animation!
+            </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style='text-align:center;background:#111827;border:1px solid #1f2d45;
+          border-radius:12px;padding:2rem 1rem;margin-top:.5rem;'>
+          <div style='font-size:2.5rem;'>✏️</div>
+          <p style='color:#4f9eff;font-weight:600;margin:.5rem 0;'>Draw above → Predict → results appear here</p>
+          <p style='color:#64748b;font-size:.82rem;'>
+            Step 1: draw in canvas &nbsp;·&nbsp;
+            Step 2: click 🔍 in canvas &nbsp;·&nbsp;
+            Step 3: click blue button below canvas
+          </p>
+        </div>""", unsafe_allow_html=True)
+
+# ── RANDOM MODE ────────────────────────────────────────────────────
+else:
+    st.markdown("""<div class='callout cy' style='margin-bottom:.6rem;'>
+    🎲 Picks a random digit from the MNIST test set with a known true label.
+    </div>""", unsafe_allow_html=True)
+
+    rc1, rc2, _ = st.columns([1.2, 3, 1.8])
+    with rc1:
+        picked = st.button("🎲 Pick Random Digit", key="pick_random_global")
+
+    if picked:
+        idx = int(np.random.choice(len(X_te_flat), 1, replace=False)[0])
+        px_norm    = X_te_4d[idx][:,:,0]
+        true_label = int(y_test[idx])
+        for key in ["perceptron", "ann", "cnn"]:
+            m = models[key]
+            if m is None: continue
+            probs, pred, img4d = predict_on_array(m, px_norm, key)
+            pfx = {"perceptron":"p_","ann":"a_","cnn":"c_"}[key]
+            st.session_state[f"{pfx}idx"]   = idx
+            st.session_state[f"{pfx}probs"] = probs
+            st.session_state[f"{pfx}pred"]  = pred
+            if key == "cnn":
+                acts = get_activation_maps(m, img4d)
+                st.session_state[f"{pfx}acts"] = acts
+                st.session_state[f"{pfx}c1t"]  = activation_thumbnails(acts["conv1"], 16, 8) if acts else None
+                st.session_state[f"{pfx}c2t"]  = activation_thumbnails(acts["conv2"], 16, 8) if acts else None
+        st.session_state["_last_random_idx"]  = idx
+        st.session_state["_last_random_true"] = true_label
+        st.rerun()
+
+    with rc2:
+        idx_now  = st.session_state.get("_last_random_idx")
+        true_now = st.session_state.get("_last_random_true")
+        if idx_now is not None and isinstance(idx_now, int):
+            p_pred = st.session_state.get("p_pred")
+            a_pred = st.session_state.get("a_pred")
+            c_pred = st.session_state.get("c_pred")
+            st.markdown(f"""
+            <div class='callout cb' style='padding:.7rem 1rem;'>
+            <div class='metric-row'>
+              <div class='metric'><span class='mv' style='color:#4f9eff;'>#{idx_now}</span><span class='mk'>Index</span></div>
+              <div class='metric'><span class='mv' style='color:#fbbf24;'>{true_now}</span><span class='mk'>True</span></div>
+              {"<div class='metric'><span class='mv' style='color:" + ('#34d399' if p_pred==true_now else '#fb923c') + ";'>" + str(p_pred) + "</span><span class='mk'>Perceptron</span></div>" if p_pred is not None else ""}
+              {"<div class='metric'><span class='mv' style='color:" + ('#34d399' if a_pred==true_now else '#fb923c') + ";'>" + str(a_pred) + "</span><span class='mk'>ANN</span></div>" if a_pred is not None else ""}
+              {"<div class='metric'><span class='mv' style='color:" + ('#34d399' if c_pred==true_now else '#fb923c') + ";'>" + str(c_pred) + "</span><span class='mk'>CNN</span></div>" if c_pred is not None else ""}
+            </div></div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='callout cb'>← Click to pick a random test digit</div>",
+                        unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+# HELPER: get pixel array for animation tabs
+# ─────────────────────────────────────────────────────────────────
+def get_px28_and_true(prefix: str):
+    idx = st.session_state.get(f"{prefix}idx")
+    if idx is None:
+        return None, None
+    if idx == "drawn":
+        drawn = st.session_state.get("drawn_pixels")
+        if drawn is None:
+            return None, None
+        return drawn.astype("float32"), None
+    return X_te_4d[idx][:,:,0], int(y_test[idx])
+
+
+# ─────────────────────────────────────────────────────────────────
+# HELPER: render one model animation tab
+# ─────────────────────────────────────────────────────────────────
+def render_model_tab(model_key, prefix, arch_rows, step_cards,
+                     anim_builder, anim_height, comparison_note):
+    model = models[model_key]
+
+    if model is None:
+        st.markdown(f"""
+        <div class='callout cr' style='margin:1rem 0;'>
+        ❌  <b>{PATHS[model_key]}</b> not found in the app folder.<br>
+        Place the file next to <code>streamlit_app.py</code> and restart.
+        </div>""", unsafe_allow_html=True)
+        return
+
+    with st.expander("📐 Architecture Reference  (click to expand)", expanded=False):
+        for num, name, shape, desc, col in arch_rows:
+            st.markdown(f"""
+            <div class='lrow'>
+              <div class='lnum' style='color:{col};'>{num}</div>
+              <div class='lbody'>
+                <span class='lname' style='color:{col};'>{name}</span>
+                <span class='lshape'>→ {shape}</span>
+                <div class='ldesc'>{desc}</div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"<p style='color:#64748b;font-size:.82rem;margin-top:.6rem;font-family:monospace;'>"
+            f"Total parameters: <span style='color:#4f9eff;'>{model.count_params():,}</span></p>",
+            unsafe_allow_html=True)
+
+    idx_now = st.session_state[f"{prefix}idx"]
+    pred    = st.session_state[f"{prefix}pred"]
+
+    if idx_now is not None and pred is not None:
+        px28, true_label = get_px28_and_true(prefix)
+        probs = st.session_state[f"{prefix}probs"]
+
+        if px28 is None:
+            st.warning("Drawing data lost — please draw again.")
+            return
+
+        vc   = "#34d399" if (true_label is None or pred==true_label) else "#fb923c"
+        conf = float(probs[pred]) * 100
+        source_str = f"Test #{idx_now}" if isinstance(idx_now, int) else "Your drawing"
+        true_str   = f"True: {true_label}" if true_label is not None else "Label: unknown (drawn)"
+
+        st.markdown(f"""
+        <div class='callout cb' style='padding:.7rem 1rem;margin-bottom:.6rem;'>
+        <div class='metric-row'>
+          <div class='metric'><span class='mv' style='color:#4f9eff;'>{source_str}</span><span class='mk'>Source</span></div>
+          <div class='metric'><span class='mv' style='color:#fbbf24;'>{true_str}</span><span class='mk'>Label</span></div>
+          <div class='metric'><span class='mv' style='color:{vc};'>{pred}</span><span class='mk'>Predicted</span></div>
+          <div class='metric'><span class='mv' style='color:{vc};'>{conf:.1f}%</span><span class='mk'>Confidence</span></div>
+        </div></div>""", unsafe_allow_html=True)
+
+        step_html = ""
+        for emoji, name, col, desc in step_cards:
+            step_html += (
+                f"<div class='step-mini' style='border-top-color:{col};'>"
+                f"<div class='sm-emoji'>{emoji}</div>"
+                f"<div class='sm-name' style='color:{col};'>{name}</div>"
+                f"<div class='sm-desc'>{desc}</div></div>"
+            )
+        st.markdown(f"<div style='display:flex;gap:5px;margin:.3rem 0 .7rem;'>{step_html}</div>",
+                    unsafe_allow_html=True)
+
+        if model_key == "cnn":
+            c1t = st.session_state[f"{prefix}c1t"] or [[[0.5]*8]*8]*16
+            c2t = st.session_state[f"{prefix}c2t"] or [[[0.3]*8]*8]*16
+            html = anim_builder(px28, true_label, pred, probs, c1t, c2t)
+        else:
+            html = anim_builder(px28, true_label, pred, probs)
+
+        components.html(html, height=anim_height, scrolling=True)
+        st.markdown(comparison_note, unsafe_allow_html=True)
+        st.markdown("---")
+
+        st.markdown("### 📊 Detailed Results")
+        lc, rc = st.columns([1, 2.2], gap="large")
+        with lc:
+            title_ov = "Your Drawing" if true_label is None else None
+            fig = fig_digit(px28, label=true_label, title_override=title_ov)
+            st.pyplot(fig); plt.close(fig)
+            st.markdown(f"""
+            <div class='rcard' style='border-color:{vc};margin-top:.5rem;'>
+              <div class='rdigit' style='color:{vc};'>{pred}</div>
+              <div class='rlabel'>Prediction</div>
+              <div class='rconf' style='color:{vc};'>{conf:.1f}% confidence</div>
+              <div style='margin-top:.5rem;font-size:.88rem;color:{vc};font-weight:600;'>
+                {("✅ Correct — True: " + str(true_label)) if true_label is not None and pred==true_label
+                  else ("❌ Wrong — True: " + str(true_label)) if true_label is not None
+                  else f"🎯 Model says: {pred}"}
+              </div>
+            </div>""", unsafe_allow_html=True)
+        with rc:
+            st.pyplot(fig_conf(probs, f"{model_key.upper()} Softmax Output"))
+            plt.close()
+            top3 = np.argsort(probs)[::-1][:3]
+            st.markdown(f"""
+            <div class='callout {"cg" if (true_label is None or pred==true_label) else "co"}'>
+            <b>Top 3 predictions:</b>&nbsp;
+            digit <b>{top3[0]}</b> ({probs[top3[0]]*100:.1f}%)  →
+            digit <b>{top3[1]}</b> ({probs[top3[1]]*100:.1f}%)  →
+            digit <b>{top3[2]}</b> ({probs[top3[2]]*100:.1f}%)
+            </div>""", unsafe_allow_html=True)
+
+        if model_key == "cnn":
+            acts = st.session_state[f"{prefix}acts"]
+            if acts:
+                st.markdown("### 🔬 Real Activation Maps")
+                st.markdown("""<div class='callout cp'>
+                <b>How to read:</b> Bright/warm tiles = the filter fired strongly.
+                Dark tiles = no response. Layer 1 detects edges. Layer 2 detects curves and loops.
+                </div>""", unsafe_allow_html=True)
+                t1, t2 = st.tabs(["🟣 Conv2D Layer 1 — 32 filters (edges)",
+                                   "🔴 Conv2D Layer 2 — 64 filters (curves)"])
+                with t1:
+                    fig = fig_actmaps(acts["conv1"], "Conv2D Layer 1", n_filters, 8)
+                    st.pyplot(fig); plt.close(fig)
+                with t2:
+                    fig = fig_actmaps(acts["conv2"], "Conv2D Layer 2", n_filters, 8)
+                    st.pyplot(fig); plt.close(fig)
+    else:
+        st.markdown(f"""
+        <div style='text-align:center;background:#111827;border:1px solid #1f2d45;
+          border-radius:12px;padding:3rem 1rem;'>
+          <div style='font-size:3.5rem;'>{"✏️" if mode=="draw" else "🎲"}</div>
+          <h3 style='color:#4f9eff!important;margin:.7rem 0 .5rem;'>
+            {"Draw a digit above" if mode=="draw" else "Pick a random digit above"}
+          </h3>
+          <p style='color:#64748b;max-width:420px;margin:0 auto;font-size:.9rem;'>
+            The animation will appear here once you provide input.
+          </p>
+        </div>""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+# THREE MODEL TABS
+# ─────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown("## 🎬 Step-by-Step Animations")
+
+tab_p, tab_a, tab_c = st.tabs([
+    "🔵  Perceptron",
+    "🟡  ANN  (Multi-Layer)",
+    "🟢  CNN  (Convolutional)",
+])
+
+with tab_p:
+    st.markdown("### 🔵 Perceptron  —  The Simplest Neural Network")
+    st.markdown("""<div class='callout cb'>
+    A Perceptron is a <b>single layer</b> of neurons connected directly from 784 input pixels to 10 output classes.
+    It learns a linear decision boundary — simple, fast, but limited.
+    </div>""", unsafe_allow_html=True)
+    render_model_tab(
+        model_key="perceptron", prefix="p_",
+        arch_rows=[
+            ("1","Input",     "784", "784 neurons — one per pixel of the 28×28 flattened image","#4f9eff"),
+            ("2","Dense(10)", "10",  "10 output neurons (784×10=7,840 weights)",                 "#34d399"),
+            ("3","Softmax",   "10",  "Converts raw scores to probabilities summing to 1.0",      "#34d399"),
+        ],
+        step_cards=[
+            ("🖼️","Input",   "#4f9eff","784 flat pixels"),
+            ("⚖️","÷255",    "#22d3ee","Normalise"),
+            ("🔗","Weights", "#a78bfa","Weighted sum"),
+            ("⚡","Activate","#fb923c","ReLU/Sigmoid"),
+            ("🎯","Output",  "#34d399","Softmax"),
+        ],
+        anim_builder=build_perceptron_anim,
+        anim_height=900,
+        comparison_note="""<div class='callout cy'>
+        <b>Perceptron limitation:</b> Because it treats the image as a flat 784-value vector,
+        it cannot detect spatial patterns. The ANN adds hidden layers; the CNN adds spatial filters.
+        </div>"""
+    )
+
+with tab_a:
+    st.markdown("### 🟡 ANN  —  Multi-Layer Perceptron")
+    st.markdown("""<div class='callout cy'>
+    An ANN adds <b>hidden layers</b> between input and output, allowing non-linear decision boundaries.
+    Still treats the image as a flat vector, but with much more expressive power.
+    </div>""", unsafe_allow_html=True)
+    render_model_tab(
+        model_key="ann", prefix="a_",
+        arch_rows=[
+            ("1","Input",        "784", "784 input neurons — normalised pixel values",    "#4f9eff"),
+            ("2","Dense(128)",   "128", "128 hidden neurons; ReLU — 100,480 params",      "#a78bfa"),
+            ("3","Dense(64)",    "64",  "64 deeper neurons; ReLU — 8,256 params",          "#f472b6"),
+            ("4","Dropout(0.5)", "64",  "Zeros ~50% of neurons during training",           "#fb923c"),
+            ("5","Dense(10)",    "10",  "10 output neurons — one per digit class",         "#34d399"),
+            ("6","Softmax",      "10",  "Probability distribution over 10 classes",        "#34d399"),
+        ],
+        step_cards=[
+            ("🖼️","Input",   "#4f9eff","784 neurons"),
+            ("⚖️","÷255",    "#22d3ee","Normalise"),
+            ("🧠","Hidden1", "#a78bfa","128 neurons"),
+            ("🔁","Hidden2", "#f472b6","64 neurons"),
+            ("💧","Dropout", "#fb923c","50% zeroed"),
+            ("🎯","Output",  "#34d399","Softmax"),
+        ],
+        anim_builder=build_ann_anim,
+        anim_height=920,
+        comparison_note="""<div class='callout cy'>
+        <b>ANN vs Perceptron:</b> Hidden layers enable non-linear learning.
+        <b>ANN vs CNN:</b> ANN still flattens the image, losing spatial structure — CNN preserves it.
+        </div>"""
+    )
+
+with tab_c:
+    st.markdown("### 🟢 CNN  —  Convolutional Neural Network")
+    st.markdown("""<div class='callout cg'>
+    A CNN preserves the <b>2D spatial structure</b>. Small learned filters slide across the image
+    to detect local patterns. This spatial awareness is why CNNs outperform ANNs on images.
+    </div>""", unsafe_allow_html=True)
+    render_model_tab(
+        model_key="cnn", prefix="c_",
+        arch_rows=[
+            ("1","Input",        "28×28×1", "2D image — spatial structure preserved",              "#4f9eff"),
+            ("2","Conv2D(32)",   "26×26×32","32 learned 3×3 filters — detects edges, corners",    "#a78bfa"),
+            ("3","MaxPool2D",    "13×13×32","2×2 window — keeps max activation, halves size",      "#fb923c"),
+            ("4","Conv2D(64)",   "11×11×64","64 deeper filters — detects curves, loops",           "#f472b6"),
+            ("5","MaxPool2D",    "5×5×64",  "2×2 window — further spatial compression",            "#fb923c"),
+            ("6","Flatten",      "1 600",   "Unrolls 5×5×64 into a 1D vector",                    "#4f9eff"),
+            ("7","Dense(128)",   "128",     "Fully-connected — combines all extracted features",  "#fbbf24"),
+            ("8","Dropout(0.5)", "128",     "Zeros 50% during training",                           "#f87171"),
+            ("9","Dense(10)",    "10",      "One neuron per digit class",                          "#34d399"),
+        ],
+        step_cards=[
+            ("🖼️","Input",  "#4f9eff","28×28 grid"),
+            ("⚖️","÷255",   "#22d3ee","Normalise"),
+            ("🔍","Conv1",  "#a78bfa","32 filters"),
+            ("📉","Pool1",  "#fb923c","Halve size"),
+            ("🔬","Conv2",  "#f472b6","64 filters"),
+            ("🧠","Dense",  "#fbbf24","128 neurons"),
+            ("🎯","Output", "#34d399","Softmax"),
+        ],
+        anim_builder=build_cnn_anim,
+        anim_height=920,
+        comparison_note="""<div class='callout cg'>
+        <b>CNN advantage:</b> 3×3 filters detect patterns regardless of WHERE they appear
+        (translation invariance). This is impossible for Perceptron and ANN.
+        </div>"""
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# FOOTER
+# ─────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown("""
+<div style='text-align:center;padding:.5rem 0;'>
+  <p style='color:#64748b;font-size:.78rem;font-family:monospace;'>
+    Deep Learning Visual Study Tool &nbsp;·&nbsp;
+    Perceptron · ANN · CNN &nbsp;·&nbsp;
+    Streamlit + TensorFlow/Keras
+  </p>
+  <p style='color:#1f2d45;font-size:.72rem;margin-top:.3rem;'>✦ Designed for deep learning students ✦</p>
+</div>""", unsafe_allow_html=True)
