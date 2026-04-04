@@ -33,15 +33,11 @@ PROBLEM FIX (v2):
   - CNN rS2/rS3/rS4: feature maps too tiny — increased tsz
   - CNN rS5: Dense neuron grid overflows — repositioned with correct bounds
   - All animations: drawn digits no longer show "WRONG" — show neutral "?" state
+
+STREAMLIT CLOUD FIX:
+  - Removed subprocess.check_call for tensorflow install (caused crash)
+  - tensorflow-cpu is now installed via requirements.txt
 """
-import sys
-import subprocess
-
-subprocess.check_call([
-    sys.executable, "-m", "pip", "install",
-    "tensorflow-cpu==2.15.0"
-])
-
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
@@ -431,7 +427,14 @@ def load_all_models():
         if not os.path.exists(path):
             models[key] = None
             continue
-        m = load_model(path, compile=False)
+        try:
+            m = load_model(path, compile=False)
+        except Exception:
+            try:
+                m = load_model(path, compile=False, safe_mode=False)
+            except Exception:
+                models[key] = None
+                continue
         try:
             raw_shape   = m.input_shape
             dummy_shape = tuple(1 if d is None else d for d in raw_shape)
@@ -775,30 +778,19 @@ function rS4(p){
   drawWires(HID_X,(i)=>CY,1,OUT_X,outY,N_OUT,a*.7,flowOut,P.green,fs4);
   drawOutputLayer(a);
 
-  // ── BAR CHART: positioned ABOVE the neuron row (left-centre zone) ──
-  // Using H directly (not CY constant) so it always renders regardless of resize timing
   if(p>.18){
     const ba=eOut((p-.18)/.82);
-
-    // Anchor chart in the middle-left zone, above neuron centre
-    // bx: just right of the hidden neuron (HID_X + 40)
-    // bw: fills space between hidden neuron and output layer
     const bx = HID_X + 40;
     const bw = Math.min(260, OUT_X - HID_X - 60);
     const bh = Math.min(100, Math.round(H * 0.22));
-    // Place chart so baseline sits 10px above the neuron centre line
     const by = H/2 - bh - 20;
 
     if(bw > 60 && by > 10){
       const bw2 = bw / 10;
-
-      // Background panel
       ct.fillStyle=rgba(P.surf2,ba*.55);
       rr(bx-6,by-18,bw+12,bh+34,8);ct.fill();
       ct.strokeStyle=rgba(P.brd,ba*.5);ct.lineWidth=.7;
       rr(bx-6,by-18,bw+12,bh+34,8);ct.stroke();
-
-      // Title
       badge('Softmax Output',bx+bw/2,by-10,P.green,10);
 
       for(let i=0;i<10;i++){
@@ -807,7 +799,6 @@ function rS4(p){
         const col=i===PRED?P.green:(i===TRUE&&TRUE>=0?P.blue:P.muted);
         ct.fillStyle=rgba(col,(i===PRED?.95:.3)*ba);
         if(animH>1){ rr(x,by+bh-animH,bw2-3,animH,2); ct.fill(); }
-        // Glow on predicted bar
         if(i===PRED&&animH>4){
           ct.shadowColor=rgba(P.green,.55);ct.shadowBlur=8;
           ct.fillStyle=rgba(P.green,.28);
@@ -822,7 +813,6 @@ function rS4(p){
           ct.fillText(Math.round(PROBS[i]*100)+'%',x+(bw2-3)/2,by+bh-animH-5);
         }
       }
-      // Baseline
       ct.strokeStyle=rgba(P.muted,.3);ct.lineWidth=.5;
       ct.beginPath();ct.moveTo(bx,by+bh);ct.lineTo(bx+bw,by+bh);ct.stroke();
     }
@@ -830,7 +820,6 @@ function rS4(p){
 
   if(p>.62){
     const va=eBounce(clamp((p-.62)/.38,0,1));
-    // GREEN = correct, RED = wrong, BLUE = drawn (no true label)
     const vc=HAS_TRUE?(OK?P.green:P.red):P.blue;
     const boxX=OUT_X+28, boxY=H/2-66, boxW=144, boxH=136;
     ct.shadowColor=rgba(vc,.45);ct.shadowBlur=22;
@@ -839,23 +828,19 @@ function rS4(p){
     ct.shadowBlur=0;
     ct.strokeStyle=rgba(vc,va*.92);ct.lineWidth=2.5;
     rr(boxX,boxY,boxW,boxH,12);ct.stroke();
-    // Top accent line
     const ga=ct.createLinearGradient(boxX,boxY,boxX+boxW,boxY);
     ga.addColorStop(0,'transparent');ga.addColorStop(.5,rgba(vc,.75));ga.addColorStop(1,'transparent');
     ct.strokeStyle=ga;ct.lineWidth=2;
     ct.beginPath();ct.moveTo(boxX+12,boxY);ct.lineTo(boxX+boxW-12,boxY);ct.stroke();
-    // Big digit
     ct.font="bold 52px 'JetBrains Mono',monospace";
     ct.fillStyle=rgba(vc,va);ct.textAlign='center';
     ct.shadowColor=rgba(vc,va*.5);ct.shadowBlur=16;
     ct.fillText(String(PRED),boxX+boxW/2,boxY+70);
     ct.shadowBlur=0;
-    // Status label
     const statusTxt=HAS_TRUE?(OK?'✓ CORRECT':'✗ WRONG'):'✦ PREDICTED';
     txt(statusTxt,boxX+boxW/2,boxY+90,rgba(vc,va*.92),10);
     txt(Math.round(PROBS[PRED]*100)+'% conf',boxX+boxW/2,boxY+106,rgba(vc,va*.8),9);
     txt(trueLabel,boxX+boxW/2,boxY+120,rgba(P.muted,va*.7),9);
-    // Confetti only on correct
     if(HAS_TRUE&&OK&&va>.5)for(let i=0;i<20;i++){
       const ang=(i/20)*Math.PI*2,d=50+i*3;
       const cx2=boxX+boxW/2+Math.cos(ang)*d*(va-.42)*1.9;
@@ -904,11 +889,9 @@ def build_ann_anim(px28, true_label, pred_label, probs):
 const cv = document.getElementById('cvs'), ct = cv.getContext('2d');
 let W, H;
 
-// ── ALL layout computed AFTER resize so nothing clips ─────────────
 function CY()  { return Math.round(H * 0.47); }
 
 function getLayers() {
-  // thumb occupies ~13% left; output layer needs ~7% right margin
   const margin = Math.round(W * 0.145);
   const span   = W - margin - Math.round(W * 0.08);
   return [
@@ -919,7 +902,7 @@ function getLayers() {
   ];
 }
 
-const SP = 24;   // neuron vertical spacing
+const SP = 24;
 
 function nyPos(layers, li, ni) {
   const L = layers[li];
@@ -928,7 +911,7 @@ function nyPos(layers, li, ni) {
 
 function resizeCanvas() {
   W = Math.min(cv.parentElement.clientWidth - 8, 1100);
-  H = Math.round(W * 0.50);          // 50% aspect → plenty of vertical room
+  H = Math.round(W * 0.50);
   cv.width  = W;
   cv.height = H;
   cv.style.height = H + 'px';
@@ -941,7 +924,6 @@ window.addEventListener('load',   () => { resizeCanvas(); startAnim(); updateUI(
 window.addEventListener('resize', () => { resizeCanvas(); if (typeof render === 'function') render(step, prog); });
 resizeCanvas();
 
-// ── Palette ──────────────────────────────────────────────────────
 const P = {
   bg:'#060b14', surf:'#0d1520', surf2:'#121c2c', brd:'#19293d',
   blue:'#4f9eff', cyan:'#22d3ee', green:'#34d399', yellow:'#fbbf24',
@@ -968,7 +950,6 @@ const STEPS = [
     d:'10 output neurons — one per digit. Softmax converts raw scores to probabilities summing to 1.0. The tallest bar is the predicted class. Watch the answer box appear!' }
 ];
 
-// ── Helpers ──────────────────────────────────────────────────────
 const lerp    = (a,b,t) => a+(b-a)*t;
 const clamp   = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
 const eOut    = t => { t=clamp(t,0,1); return 1-Math.pow(1-t,3); };
@@ -1047,7 +1028,6 @@ function drawDigit(cx,cy,cs,alpha,warmth){
   }
 }
 
-// thumb: responsive position, never clips
 function thumb(alpha){
   const ts=3.4;
   const tx=Math.round(W*0.054);
@@ -1063,7 +1043,6 @@ function thumb(alpha){
   badge(trueLabel,tx,ty+ts*14+34,P.yellow,10);
 }
 
-// glassmorphism formula box
 function formulaBox(x,y,w,h,col,alpha,lines){
   ct.fillStyle=rgba(P.surf2,alpha*.96);
   ct.strokeStyle=rgba(col,alpha*.5);
@@ -1078,11 +1057,10 @@ function formulaBox(x,y,w,h,col,alpha,lines){
   });
 }
 
-// safe formula box — always positioned below neuron rows, within canvas
 function safeFBox(col,alpha,lines){
   const yBase = CY() + Math.round(SP * 5.8) + 12;
   const h     = lines.length * 20 + 18;
-  if(yBase + h > H - 2) return;       // no room → skip gracefully
+  if(yBase + h > H - 2) return;
   formulaBox(14, yBase, W-28, h, col, alpha, lines);
 }
 
@@ -1097,23 +1075,18 @@ function header(s,p){
   rr(10,10,W-20,44,8); ct.fill();
   ct.strokeStyle=rgba(st.col,.22); ct.lineWidth=.9;
   rr(10,10,W-20,44,8); ct.stroke();
-  // animated top accent line
   const grd=ct.createLinearGradient(10,0,W-10,0);
   grd.addColorStop(0,'transparent'); grd.addColorStop(.5,rgba(st.col,.75)); grd.addColorStop(1,'transparent');
   ct.strokeStyle=grd; ct.lineWidth=1.5;
   ct.beginPath(); ct.moveTo(10,10); ct.lineTo(W-10,10); ct.stroke();
-  // emoji
   ct.font='16px serif'; ct.textAlign='left'; ct.fillText(st.e,22,37);
-  // title
   ct.font=`bold 12.5px 'Space Grotesk',sans-serif`;
   ct.fillStyle=rgba(P.text,a); ct.textAlign='left'; ct.fillText(st.n,48,37);
-  // right tag
   ct.font=`10px 'JetBrains Mono',monospace`;
   ct.fillStyle=rgba(st.col,a*.8); ct.textAlign='right';
   ct.fillText('ANN · Multi-Layer Perceptron',W-14,37);
 }
 
-// ── Layer helpers ────────────────────────────────────────────────
 function drawConnections(layers,li1,li2,alpha,flowProg,highlightCol){
   const L1=layers[li1], L2=layers[li2];
   for(let i=0;i<L1.n;i++) for(let j=0;j<L2.n;j+=2){
@@ -1169,10 +1142,6 @@ function layerLabel(layers,li,alpha){
   lbl(L.name, L.x, bot,    rgba(L.col,alpha*.95),10);
   lbl(L.sub,  L.x, bot+16, rgba(P.muted,alpha*.8),9);
 }
-
-// ══════════════════════════════════════════════════════════════════
-// STEP RENDERERS  — all positions derived from W, H, CY()
-// ══════════════════════════════════════════════════════════════════
 
 function rS0(p){
   const cs=lerp(0,9.5,eBounce(clamp(p*1.6,0,1)));
@@ -1311,7 +1280,6 @@ function rS4(p){
 function rS5(p){
   const a=eOut(p), ls=getLayers();
 
-  // faint background layers
   drawConnections(ls,0,1,a*.11,0,null);
   drawConnections(ls,1,2,a*.11,0,null);
   drawLayer(ls,0,a*.13,0.3,false,0,0);
@@ -1319,7 +1287,6 @@ function rS5(p){
   drawLayer(ls,2,a*.13,0.3,false,0,0);
   drawConnections(ls,2,3,a*.65,clamp(p*2.2,0,1),P.green);
 
-  // Output neurons
   for(let i=0;i<10;i++){
     const y=CY()+(i-4.5)*SP, active=(i===PRED);
     if(active) glow(ls[3].x,y,12,P.green,clamp(a,0,1));
@@ -1336,23 +1303,17 @@ function rS5(p){
   lbl('10, Softmax', ls[3].x,CY()+5*SP+36,rgba(P.muted,a*.8),  9);
   badge('→ Softmax →',ls[3].x+62,CY(),P.green,10);
 
-  // ── BAR CHART: left side, ABOVE neuron midline — never overlaps network ──
   if(p>.18){
     const ba=eOut((p-.18)/.82);
-
-    // Position chart between thumb right edge and Hidden Layer 1
     const chartLeft = Math.round(W * 0.13);
     const chartRight = ls[1].x - 30;
     const bw = Math.max(60, chartRight - chartLeft);
     const bh = Math.min(Math.round(H * 0.30), 120);
-    // Anchor: top of chart is 30px above CY, grows upward
     const by = CY() - bh - 30;
     const bx = chartLeft;
 
     if(by > 10 && bx + bw < ls[1].x - 10){
       const bw2 = bw / 10;
-
-      // chart background panel
       ct.fillStyle=rgba(P.surf,ba*.5);
       rr(bx-4,by-4,bw+8,bh+26,8); ct.fill();
       ct.strokeStyle=rgba(P.brd,ba*.4); ct.lineWidth=.6;
@@ -1363,10 +1324,8 @@ function rS5(p){
         const animH=bh2*clamp((p-.18)/.6,0,1);
         const x=bx+i*bw2+1.5;
         const col=i===PRED?P.green:(i===TRUE&&TRUE>=0?P.blue:P.muted);
-        // bar fill
         ct.fillStyle=rgba(col,(i===PRED?.9:.24)*ba);
         rr(x,by+bh-animH,bw2-3,animH,2); ct.fill();
-        // predicted bar glow
         if(i===PRED&&animH>4){
           ct.shadowColor=rgba(P.green,.5); ct.shadowBlur=9;
           ct.fillStyle=rgba(P.green,.3);
@@ -1381,44 +1340,35 @@ function rS5(p){
           ct.fillText(Math.round(PROBS[i]*100)+'%',x+(bw2-3)/2,by+bh-animH-8);
         }
       }
-      // baseline
       ct.strokeStyle=rgba(P.muted,.22); ct.lineWidth=.5;
       ct.beginPath(); ct.moveTo(bx,by+bh); ct.lineTo(bx+bw,by+bh); ct.stroke();
       badge('Softmax Confidence',bx+bw/2,by-12,P.green,10);
     }
   }
 
-  // ── Result box — right of output layer, bounces in ──
   if(p>.62){
     const va=eBounce(clamp((p-.62)/.38,0,1));
-    // GREEN = correct, RED = wrong, BLUE = drawn (no true label)
     const vc=HAS_TRUE?(OK?P.green:P.red):P.blue;
     const bw=150, bh=140;
     const bx=W-bw-12, by=Math.round(H*.07);
-    // shadow
     ct.shadowColor=rgba(vc,.36); ct.shadowBlur=26;
     ct.fillStyle=rgba(P.dark,.97); rr(bx,by,bw,bh,14); ct.fill();
     ct.shadowBlur=0;
-    // border
     ct.strokeStyle=rgba(vc,va*.9); ct.lineWidth=2.5;
     rr(bx,by,bw,bh,14); ct.stroke();
-    // top gradient accent
     const g3=ct.createLinearGradient(bx,by,bx+bw,by);
     g3.addColorStop(0,'transparent'); g3.addColorStop(.5,rgba(vc,.7)); g3.addColorStop(1,'transparent');
     ct.strokeStyle=g3; ct.lineWidth=2;
     ct.beginPath(); ct.moveTo(bx+14,by); ct.lineTo(bx+bw-14,by); ct.stroke();
-    // large digit
     ct.font=`bold 54px 'JetBrains Mono',monospace`;
     ct.fillStyle=rgba(vc,va); ct.textAlign='center';
     ct.shadowColor=rgba(vc,va*.5); ct.shadowBlur=18;
     ct.fillText(String(PRED),bx+bw/2,by+70);
     ct.shadowBlur=0;
-    // Status label — neutral for drawn digits
     const statusTxt=HAS_TRUE?(OK?'✓ CORRECT':'✗ WRONG'):'✦ PREDICTED';
     txt(statusTxt,                           bx+bw/2,by+90,  rgba(vc,va*.9),   10);
     txt(Math.round(PROBS[PRED]*100)+'% conf',bx+bw/2,by+106, rgba(vc,va*.75),  9);
     txt(trueLabel,                           bx+bw/2,by+120, rgba(P.muted,va*.65), 9);
-    // confetti on correct
     if(HAS_TRUE&&OK&&va>.5) for(let i=0;i<22;i++){
       const ang=(i/22)*Math.PI*2, d=44+i*2.8;
       const cx2=bx+bw/2+Math.cos(ang)*d*(va-.42)*2.1;
@@ -1429,14 +1379,12 @@ function rS5(p){
   }
 }
 
-// ══════════════════════════════════════════════════════════════════
 const RENDERS = [rS0, rS1, rS2, rS3, rS4, rS5];
 
 function render(s, p){
   ct.fillStyle=P.bg; ct.fillRect(0,0,W,H);
   topBar(p, STEPS[s].col);
   header(s, p);
-  // content area starts at y=60 (below 44px header + 6px gap + 10px top)
   ct.save(); ct.translate(0, 60); RENDERS[s](p); ct.restore();
 }
 
@@ -1556,10 +1504,8 @@ function neuron(x,y,r,col,alpha){ct.beginPath();ct.arc(x,y,r,0,Math.PI*2);ct.fil
 function drawDigit(cx,cy,cs,alpha,warmth){warmth=warmth||0;for(let r=0;r<28;r++)for(let c=0;c<28;c++){const v=PX[r][c],px=cx+(c-14)*cs+cs*.5,py=cy+(r-14)*cs+cs*.5;if(v>.04){const vi=Math.min(v*1.25,1);ct.fillStyle=warmth>0?`rgba(${Math.round(lerp(79,251,vi*warmth))},${Math.round(lerp(158,191,vi*warmth))},${Math.round(lerp(255,36,vi*warmth))},${alpha})`:`rgba(${Math.round(lerp(15,79,vi))},${Math.round(lerp(30,158,vi))},${Math.round(lerp(50,255,vi))},${alpha})`}else ct.fillStyle=`rgba(15,20,35,${alpha})`;ct.fillRect(px,py,cs-.5,cs-.5)}}
 function thumb(alpha){const ts=3.6,tx=56,ty=H/2+6;ct.fillStyle=rgba(P.surf2,.95);rr(tx-ts*14-5,ty-ts*14-5,ts*28+10,ts*28+10,6);ct.fill();ct.strokeStyle=rgba(P.brd,.7);ct.lineWidth=.8;rr(tx-ts*14-5,ty-ts*14-5,ts*28+10,ts*28+10,6);ct.stroke();drawDigit(tx,ty,ts,alpha,0);lbl('Your digit',tx,ty+ts*14+14,P.muted,9);badge(trueLabel,tx,ty+ts*14+30,P.yellow,10)}
 
-// ── Improved drawMaps: bigger tiles, better labeled ───────────────
 function drawMaps(maps,ox,oy,tsz,gap,cols,alpha,cF){
   const rows=Math.ceil(maps.length/cols);
-  // background panel
   const pw=cols*(tsz+gap)-gap+10, ph=rows*(tsz+gap+12)-gap+10;
   ct.fillStyle=rgba(P.surf2,alpha*.4);
   rr(ox-5,oy-5,pw,ph,6);ct.fill();
@@ -1576,7 +1522,6 @@ function drawMaps(maps,ox,oy,tsz,gap,cols,alpha,cF){
     }
     ct.strokeStyle=rgba(P.brd,alpha*.5);ct.lineWidth=.6;
     rr(x,y,tsz,tsz,4);ct.stroke();
-    // label below each map
     ct.font=`8px 'JetBrains Mono',monospace`;
     ct.fillStyle=rgba(P.muted,alpha*.75);
     ct.textAlign='center';
@@ -1624,12 +1569,10 @@ function rS1(p){
   }
 }
 
-// ── rS2: Conv1 — larger maps, more visible ───────────────────────
 function rS2(p){
   const a=eO(p);
   thumb(clamp(a,0,1));
 
-  // Animated filter sliding on digit
   const fp=Math.floor(p*25);
   const ts=3.6,tx=56,ty=H/2+6;
   const fx=fp%5,fy=Math.min(Math.floor(fp/5),4);
@@ -1645,13 +1588,11 @@ function rS2(p){
 
   if(p>.22){
     const ma=eO((p-.22)/.78);
-    // FIXED: larger maps, better positioned, 2 rows of 8
     const mapTsz=26, mapGap=5, mapCols=8;
     const mapsStartX=162;
     const mapsStartY=H/2-80;
     drawMaps(C1,mapsStartX,mapsStartY,mapTsz,mapGap,mapCols,ma,
       v=>[Math.round(lerp(15,167,v)),Math.round(lerp(30,139,v)),Math.round(lerp(50,250,v))]);
-    // label positioned after maps
     const mapsW=mapCols*(mapTsz+mapGap);
     lbl('32 real Conv1 activation maps',mapsStartX+mapsW/2,mapsStartY+2*(mapTsz+12+mapGap)+10,P.purple,9);
     badge('26×26×32',mapsStartX+mapsW/2,mapsStartY+2*(mapTsz+12+mapGap)+28,P.purple,10);
@@ -1659,7 +1600,6 @@ function rS2(p){
 
   if(p>.55){
     const fa=eO((p-.55)/.45);
-    // 3×3 filter grid on right side
     const gx=W-180, gy=H/2-60;
     ct.fillStyle=rgba(P.dark,fa*.95);
     rr(gx,gy,160,138,10);ct.fill();
@@ -1678,12 +1618,10 @@ function rS2(p){
   }
 }
 
-// ── rS3: MaxPooling — bigger, clearer maps ───────────────────────
 function rS3(p){
   const a=eO(p);
   thumb(clamp(a,0,1));
 
-  // Input maps (left): tsz=16
   const tsz1=16, gap1=3, cols1=8;
   const mx1=162, my1=H/2-55;
   drawMaps(C1,mx1,my1,tsz1,gap1,cols1,clamp(a,0,1),
@@ -1693,7 +1631,6 @@ function rS3(p){
 
   arrow(mx1+mw1+12,H/2+6,mx1+mw1+44,H/2+6,P.orange,clamp(a,0,1),2.5);
 
-  // 2×2 pooling window illustration
   if(p>.2){
     const pa=eO((p-.2)/.8);
     const bx=mx1+mw1+52, by=H/2-60;
@@ -1713,7 +1650,6 @@ function rS3(p){
     lbl('max=211 ✓',bx+55,by+102,P.green,10);
   }
 
-  // Output maps (right): tsz=16
   const arrowStartX = mx1+mw1+170;
   arrow(arrowStartX,H/2+6,arrowStartX+30,H/2+6,P.orange,clamp(a,0,1),2.5);
 
@@ -1727,12 +1663,10 @@ function rS3(p){
   }
 }
 
-// ── rS4: Conv2 — larger maps for both C1 and C2 ─────────────────
 function rS4(p){
   const a=eO(p);
   thumb(clamp(a,0,1));
 
-  // C1 maps (input): tsz=16
   const tsz1=16, gap1=3, cols1=8;
   const mx1=162, my1=H/2-55;
   drawMaps(C1,mx1,my1,tsz1,gap1,cols1,clamp(a,0,1),
@@ -1744,7 +1678,6 @@ function rS4(p){
 
   if(p>.2){
     const ma=eO((p-.2)/.8);
-    // C2 maps: tsz=18, 2 rows of 8
     const tsz2=18, gap2=4, cols2=8;
     const mx2=mx1+mw1+52, my2=H/2-62;
     drawMaps(C2,mx2,my2,tsz2,gap2,cols2,ma,
@@ -1755,12 +1688,10 @@ function rS4(p){
   }
 }
 
-// ── rS5: Flatten → Dense — repositioned neuron grid ─────────────
 function rS5(p){
   const a=eO(p);
   thumb(clamp(a,0,1));
 
-  // Compressing C2 maps
   const compress=Math.min(p*1.6,1);
   const mw=Math.max(Math.round(lerp(14,3,compress)),3);
   const tsz=mw+2, gap=2, cols=8;
@@ -1769,13 +1700,11 @@ function rS5(p){
     v=>[Math.round(lerp(20,244,v)),Math.round(lerp(20,114,v)),Math.round(lerp(20,182,v))]);
   const mw_px=cols*(tsz+gap);
 
-  // Arrow to flatten
   arrow(mx+mw_px+10,H/2+6,mx+mw_px+42,H/2+6,P.yellow,clamp(a,0,1),2.5);
   badge('Flatten  1600',mx+mw_px+80,H/2+4,P.muted,10);
 
   if(p>.3){
     const na=eO((p-.3)/.7);
-    // Dense neuron grid: safe position, responsive sizing
     const gridStartX=mx+mw_px+130;
     const gridCols=12, gridRows=6;
     const nRadius=7;
@@ -1783,7 +1712,6 @@ function rS5(p){
     const gridW=gridCols*nGapX, gridH=gridRows*nGapY;
     const gridY=H/2-gridH/2;
 
-    // Grid background
     ct.fillStyle=rgba(P.surf2,na*.3);
     rr(gridStartX-8,gridY-8,gridW+16,gridH+16,8);ct.fill();
 
@@ -1845,7 +1773,6 @@ function rS6(p){
 
   if(p>.65){
     const va=eE(clamp((p-.65)/.35,0,1));
-    // GREEN = correct, RED = wrong, BLUE = drawn (no true label)
     const vc=HAS_TRUE?(OK?P.green:P.red):P.blue;
     ct.shadowColor=rgba(vc,.4);ct.shadowBlur=18;
     ct.fillStyle=rgba(P.dark,.95);
@@ -1856,7 +1783,6 @@ function rS6(p){
     ct.font="bold 52px 'JetBrains Mono',monospace";
     ct.fillStyle=rgba(vc,va);ct.textAlign='center';
     ct.fillText(String(PRED),692,H/2+12);
-    // Status label
     const statusTxt=HAS_TRUE?(OK?'✓ CORRECT':'✗ WRONG'):'✦ PREDICTED';
     txt(statusTxt,692,H/2+38,rgba(vc,va*.9),10);
     txt(Math.round(PROBS[PRED]*100)+'% conf',692,H/2+54,rgba(vc,va*.8),9);
@@ -1925,7 +1851,7 @@ st.markdown("""
 <div class='hero'>
   <div class='hero-title'>🧠 Deep Learning Visual Study Tool</div>
   <div class='hero-sub'>
-    Draw your own digit on the 28×28 grid — or pick a random test sample — 
+    Draw your own digit on the 28×28 grid — or pick a random test sample —
     and watch Perceptron, ANN, and CNN each process it step by step.
   </div>
 </div>
@@ -2152,7 +2078,7 @@ def render_model_tab(model_key, prefix, arch_rows, step_cards,
         st.markdown(f"""
         <div class='callout cr' style='margin:1rem 0;'>
         ❌  <b>{PATHS[model_key]}</b> not found in the app folder.<br>
-        Place the file next to <code>streamlit_app.py</code> and restart.
+        Place the file next to <code>app.py</code> and restart.
         </div>""", unsafe_allow_html=True)
         return
 
