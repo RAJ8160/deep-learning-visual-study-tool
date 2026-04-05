@@ -1,9 +1,9 @@
 streamlit
-numpy==1.26.4
+numpy
 matplotlib
 pillow
 h5py
 pandas
 seaborn
 streamlit-drawable-canvas
-tensorflow-cpu==2.15.0
+tensorflow-cpu
