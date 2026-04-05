@@ -414,12 +414,24 @@ def load_data():
 # ─────────────────────────────────────────────────────────────────
 # MODEL LOADING
 # ─────────────────────────────────────────────────────────────────
-_DIR = os.path.dirname(os.path.abspath(__file__))
+# Resolve model paths
+def find_model(filename):
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
+        os.path.join(os.getcwd(), filename),
+        os.path.join("/mount/src/deep-learning-visual-study-tool", filename),
+        filename,
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    # Last resort — return the first candidate anyway
+    return candidates[0]
 
 PATHS = {
-    "perceptron": os.path.join(_DIR, "perceptron_model.h5"),
-    "ann":        os.path.join(_DIR, "ann_model.h5"),
-    "cnn":        os.path.join(_DIR, "cnn_model.h5"),
+    "perceptron": find_model("perceptron_model.h5"),
+    "ann":        find_model("ann_model.h5"),
+    "cnn":        find_model("cnn_model.h5"),
 }
 
 @st.cache_resource(show_spinner=False)
@@ -1824,12 +1836,15 @@ with st.sidebar:
     st.markdown("## 🧠 DL Visual Study")
     st.markdown("---")
     for key, path in PATHS.items():
-        exists = os.path.exists(path)
-        icon   = "✅" if exists else "❌"
-        color  = "#34d399" if exists else "#f87171"
+        try:
+            m = tf.keras.models.load_model(path, compile=False)
+            icon, color = "✅", "#34d399"
+            del m
+        except:
+            icon, color = "❌", "#f87171"
         st.markdown(
             f"<div style='font-family:monospace;font-size:.8rem;margin:.3rem 0;'>"
-            f"{icon} <span style='color:{color};'>{path}</span></div>",
+            f"{icon} <span style='color:{color};'>{os.path.basename(path)}</span></div>",
             unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("### ⚙️ Settings")
