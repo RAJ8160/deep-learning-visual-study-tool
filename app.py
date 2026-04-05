@@ -415,12 +415,22 @@ def load_data():
 # MODEL LOADING
 # ─────────────────────────────────────────────────────────────────
 # Resolve model paths
-_DIR = os.path.dirname(os.path.abspath(__file__))
+def find_model(filename):
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
+        os.path.join(os.getcwd(), filename),
+        os.path.join("/mount/src/deep-learning-visual-study-tool", filename),
+        filename,
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 PATHS = {
-    "perceptron": os.path.join(_DIR, "perceptron_model.h5"),
-    "ann":        os.path.join(_DIR, "ann_model.h5"),
-    "cnn":        os.path.join(_DIR, "cnn_model.h5"),
+    "perceptron": find_model("perceptron_model.h5"),
+    "ann":        find_model("ann_model.h5"),
+    "cnn":        find_model("cnn_model.h5"),
 }
 @st.cache_resource(show_spinner=False)
 def load_all_models():
