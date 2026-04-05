@@ -436,9 +436,6 @@ PATHS = {
 def load_all_models():
     models = {}
     for key, path in PATHS.items():
-        if not os.path.exists(path):
-            models[key] = None
-            continue
         try:
             m = load_model(path, compile=False)
         except Exception:
